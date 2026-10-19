@@ -1,0 +1,371 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/DonBlack-117/watchkeeper/internal/check"
+	"github.com/DonBlack-117/watchkeeper/internal/store"
+)
+
+// memStore is an in-memory Store for handler tests.
+type memStore struct {
+	mu      sync.Mutex
+	nextID  int64
+	checks  map[int64]check.Check
+	results map[int64][]check.Result // newest first
+	pingErr error
+}
+
+func newMem() *memStore {
+	return &memStore{checks: map[int64]check.Check{}, results: map[int64][]check.Result{}}
+}
+
+func (m *memStore) Ping(context.Context) error { return m.pingErr }
+
+func (m *memStore) CreateCheck(_ context.Context, c check.Check) (check.Check, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextID++
+	c.ID, c.CreatedAt, c.UpdatedAt = m.nextID, time.Now(), time.Now()
+	m.checks[c.ID] = c
+	return c, nil
+}
+
+func (m *memStore) GetCheck(_ context.Context, id int64) (check.Check, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.checks[id]
+	if !ok {
+		return c, store.ErrNotFound
+	}
+	return c, nil
+}
+
+func (m *memStore) ListChecks(context.Context) ([]check.Check, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []check.Check{}
+	for id := int64(1); id <= m.nextID; id++ {
+		if c, ok := m.checks[id]; ok {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) CountChecks(context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.checks), nil
+}
+
+func (m *memStore) UpdateCheck(_ context.Context, c check.Check) (check.Check, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.checks[c.ID]; !ok {
+		return c, store.ErrNotFound
+	}
+	m.checks[c.ID] = c
+	return c, nil
+}
+
+func (m *memStore) DeleteCheck(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.checks[id]; !ok {
+		return store.ErrNotFound
+	}
+	delete(m.checks, id)
+	return nil
+}
+
+func (m *memStore) ListResults(_ context.Context, q store.ResultQuery) ([]check.Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []check.Result{}
+	for _, r := range m.results[q.CheckID] {
+		if q.BeforeID != 0 && r.ID >= q.BeforeID {
+			continue
+		}
+		if len(out) == q.Limit {
+			break
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (m *memStore) RecentResults(_ context.Context, n int) (map[int64][]check.Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[int64][]check.Result{}
+	for id, rs := range m.results {
+		out[id] = rs[:min(n, len(rs))]
+	}
+	return out, nil
+}
+
+func (m *memStore) DailyUptime(_ context.Context, _ int64, days int, now time.Time) ([]store.DayUptime, error) {
+	out := make([]store.DayUptime, days)
+	for i := range out {
+		out[i].Day = now.AddDate(0, 0, i-days+1).Format(time.DateOnly)
+	}
+	return out, nil
+}
+
+func (m *memStore) UptimeSince(context.Context, time.Time) (map[int64]float64, error) {
+	return map[int64]float64{1: 99.5}, nil
+}
+
+func newServer(m *memStore) http.Handler { return newServerWith(m, Options{}) }
+
+func newServerWith(m *memStore, opts Options) http.Handler {
+	s := New(m, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	s.now = func() time.Time { return time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC) }
+	return s.Handler()
+}
+
+func do(t *testing.T, h http.Handler, method, path, body string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var out map[string]any
+	if rec.Body.Len() > 0 {
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("response is not JSON: %s", rec.Body.String())
+		}
+	}
+	return rec, out
+}
+
+const validBody = `{"name":"btc API","kind":"http","target":"https://api.btc-bot.dev/health"}`
+
+func TestCreateAndGetCheck(t *testing.T) {
+	h := newServer(newMem())
+
+	rec, body := do(t, h, "POST", "/api/v1/checks", validBody)
+	if rec.Code != http.StatusCreated || rec.Header().Get("Location") != "/api/v1/checks/1" {
+		t.Fatalf("create: %d %v", rec.Code, body)
+	}
+	data := body["data"].(map[string]any)
+	if data["intervalS"].(float64) != 60 || data["timeoutMs"].(float64) != 10000 || data["enabled"] != true {
+		t.Errorf("defaults not applied: %v", data)
+	}
+	if data["status"] != "unknown" {
+		t.Errorf("a new check has no results yet: %v", data["status"])
+	}
+
+	rec, body = do(t, h, "GET", "/api/v1/checks/1", "")
+	if rec.Code != http.StatusOK || body["data"].(map[string]any)["name"] != "btc API" {
+		t.Fatalf("get: %d %v", rec.Code, body)
+	}
+}
+
+func TestValidationProblem(t *testing.T) {
+	h := newServer(newMem())
+	rec, body := do(t, h, "POST", "/api/v1/checks", `{"name":"x","kind":"http","target":"nope","intervalS":5}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("content type = %s", ct)
+	}
+	errs := body["errors"].([]any)
+	if len(errs) != 2 {
+		t.Errorf("want target and intervalS errors, got %v", errs)
+	}
+}
+
+func TestBadJSON(t *testing.T) {
+	h := newServer(newMem())
+	for _, b := range []string{`{`, `{"unknown":1}`, validBody + `{}`} {
+		if rec, _ := do(t, h, "POST", "/api/v1/checks", b); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d", b, rec.Code)
+		}
+	}
+}
+
+func TestPatchAndDelete(t *testing.T) {
+	h := newServer(newMem())
+	do(t, h, "POST", "/api/v1/checks", validBody)
+
+	rec, body := do(t, h, "PATCH", "/api/v1/checks/1", `{"enabled":false,"intervalS":120}`)
+	data := body["data"].(map[string]any)
+	if rec.Code != http.StatusOK || data["enabled"] != false || data["intervalS"].(float64) != 120 || data["name"] != "btc API" {
+		t.Fatalf("patch: %d %v", rec.Code, body)
+	}
+	if rec, _ := do(t, h, "PATCH", "/api/v1/checks/1", `{"timeoutMs":999999}`); rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("invalid patch status = %d", rec.Code)
+	}
+	if rec, _ := do(t, h, "DELETE", "/api/v1/checks/1", ""); rec.Code != http.StatusNoContent {
+		t.Errorf("delete status = %d", rec.Code)
+	}
+	for _, p := range []string{"/api/v1/checks/1", "/api/v1/checks/abc", "/api/v1/checks/1/uptime"} {
+		if rec, _ := do(t, h, "GET", p, ""); rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d", p, rec.Code)
+		}
+	}
+}
+
+func TestResultsCursor(t *testing.T) {
+	m := newMem()
+	h := newServer(m)
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	for id := int64(5); id >= 1; id-- {
+		m.results[1] = append(m.results[1], check.Result{ID: id, CheckID: 1, OK: true})
+	}
+
+	_, body := do(t, h, "GET", "/api/v1/checks/1/results?limit=2", "")
+	cursor, _ := body["meta"].(map[string]any)["nextCursor"].(string)
+	if len(body["data"].([]any)) != 2 || cursor == "" {
+		t.Fatalf("first page: %v", body)
+	}
+	_, body = do(t, h, "GET", "/api/v1/checks/1/results?limit=2&cursor="+cursor, "")
+	first := body["data"].([]any)[0].(map[string]any)
+	if first["id"].(float64) != 3 {
+		t.Fatalf("second page should start at id 3: %v", body)
+	}
+	for _, q := range []string{"limit=0", "limit=9999", "cursor=not!base64", "from=yesterday"} {
+		if rec, _ := do(t, h, "GET", "/api/v1/checks/1/results?"+q, ""); rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("%s: status = %d", q, rec.Code)
+		}
+	}
+}
+
+func TestUptimeDays(t *testing.T) {
+	h := newServer(newMem())
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	_, body := do(t, h, "GET", "/api/v1/checks/1/uptime", "")
+	days := body["data"].([]any)
+	if len(days) != 90 || days[89].(map[string]any)["day"] != "2026-10-19" {
+		t.Fatalf("default should be 90 days ending today: %d entries", len(days))
+	}
+	if rec, _ := do(t, h, "GET", "/api/v1/checks/1/uptime?days=91", ""); rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("days=91 status = %d", rec.Code)
+	}
+}
+
+func TestStatus(t *testing.T) {
+	m := newMem()
+	h := newServer(m)
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	do(t, h, "POST", "/api/v1/checks", `{"name":"dns","kind":"dns","target":"donblack.dev"}`)
+	do(t, h, "POST", "/api/v1/checks", `{"name":"off","kind":"dns","target":"off.dev","enabled":false}`)
+	m.results[1] = []check.Result{{ID: 2, CheckID: 1, OK: true, TotalMS: 100}, {ID: 1, CheckID: 1, OK: false}}
+
+	_, body := do(t, h, "GET", "/api/v1/status", "")
+	data := body["data"].(map[string]any)
+	checks := data["checks"].([]any)
+	if data["overall"] != "degraded" || len(checks) != 2 {
+		t.Fatalf("status: %v", data)
+	}
+	first := checks[0].(map[string]any)
+	if first["uptime90"].(float64) != 99.5 || first["status"] != "degraded" {
+		t.Errorf("first check: %v", first)
+	}
+	if _, leaked := first["target"]; leaked {
+		t.Error("the public status must not expose targets")
+	}
+}
+
+func TestHealth(t *testing.T) {
+	m := newMem()
+	h := newServer(m)
+	if rec, _ := do(t, h, "GET", "/api/v1/health", ""); rec.Code != http.StatusOK {
+		t.Fatalf("health = %d", rec.Code)
+	}
+	m.pingErr = errors.New("down")
+	if rec, _ := do(t, h, "GET", "/api/v1/health", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("health with db down = %d", rec.Code)
+	}
+}
+
+func TestTokenAuth(t *testing.T) {
+	token := strings.Repeat("a", 32)
+	h := newServerWith(newMem(), Options{Token: token})
+
+	if rec, _ := do(t, h, "GET", "/api/v1/checks", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d", rec.Code)
+	}
+	for _, p := range []string{"/api/v1/status", "/api/v1/health"} {
+		head := httptest.NewRecorder()
+		h.ServeHTTP(head, httptest.NewRequest("HEAD", p, nil))
+		if head.Code != http.StatusOK {
+			t.Errorf("HEAD %s must stay public, got %d", p, head.Code)
+		}
+		if rec, _ := do(t, h, "GET", p, ""); rec.Code != http.StatusOK {
+			t.Errorf("%s must stay public, got %d", p, rec.Code)
+		}
+	}
+	req := httptest.NewRequest("GET", "/api/v1/checks", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid token: status = %d", rec.Code)
+	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("security headers missing: %v", rec.Header())
+	}
+}
+
+func TestPrivateTargetsRejected(t *testing.T) {
+	h := newServer(newMem())
+	for _, target := range []string{"http://localhost:8080", "http://169.254.169.254/latest", "https://10.0.0.5"} {
+		body := `{"name":"x","kind":"http","target":"` + target + `"}`
+		if rec, _ := do(t, h, "POST", "/api/v1/checks", body); rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("%s: status = %d, want 422", target, rec.Code)
+		}
+	}
+	allowed := newServerWith(newMem(), Options{AllowPrivate: true})
+	if rec, _ := do(t, allowed, "POST", "/api/v1/checks", `{"name":"x","kind":"http","target":"http://localhost:8080"}`); rec.Code != http.StatusCreated {
+		t.Errorf("with AllowPrivate: status = %d", rec.Code)
+	}
+}
+
+func TestMaxChecks(t *testing.T) {
+	h := newServerWith(newMem(), Options{MaxChecks: 1})
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	if rec, _ := do(t, h, "POST", "/api/v1/checks", validBody); rec.Code != http.StatusConflict {
+		t.Fatalf("second check: status = %d, want 409", rec.Code)
+	}
+}
+
+func TestStatusCacheAndRateLimit(t *testing.T) {
+	m := newMem()
+	h := newServerWith(m, Options{StatusRate: 3, StatusTTL: time.Hour})
+	do(t, h, "POST", "/api/v1/checks", validBody)
+
+	_, first := do(t, h, "GET", "/api/v1/status", "")
+	do(t, h, "POST", "/api/v1/checks", `{"name":"new","kind":"dns","target":"donblack.dev"}`)
+	rec, second := do(t, h, "GET", "/api/v1/status", "")
+	if len(second["data"].(map[string]any)["checks"].([]any)) != len(first["data"].(map[string]any)["checks"].([]any)) {
+		t.Error("status should be served from cache within the TTL")
+	}
+	if !strings.HasPrefix(rec.Header().Get("Cache-Control"), "public") {
+		t.Errorf("Cache-Control = %q", rec.Header().Get("Cache-Control"))
+	}
+	do(t, h, "GET", "/api/v1/status", "")
+	if rec, _ := do(t, h, "GET", "/api/v1/status", ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("fourth request: status = %d, want 429", rec.Code)
+	}
+}
+
+func TestHealthReportsScheduler(t *testing.T) {
+	h := newServerWith(newMem(), Options{Health: func() error { return errors.New("check list not reloaded recently") }})
+	rec, body := do(t, h, "GET", "/api/v1/health", "")
+	if rec.Code != http.StatusServiceUnavailable || body["scheduler"] != "check list not reloaded recently" {
+		t.Fatalf("health = %d %v", rec.Code, body)
+	}
+}

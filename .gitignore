@@ -1,0 +1,12 @@
+# Binaries and coverage
+/watchkeeper
+*.out
+
+# Local settings
+.env
+
+# Editors and assistants
+.idea/
+.vscode/
+.claude/
+CLAUDE.md
