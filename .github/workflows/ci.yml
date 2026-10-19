@@ -17,7 +17,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go vet ./...
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.11.3
       # Integration tests start PostgreSQL with Testcontainers; the runner has Docker.
