@@ -10,7 +10,7 @@ COPY web/ ./
 RUN npm run build
 
 # 2. Go binary, cross-compiled for the target platform (amd64 or arm64).
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27-alpine AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
