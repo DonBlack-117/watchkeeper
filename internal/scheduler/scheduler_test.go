@@ -186,3 +186,19 @@ func TestHealthy(t *testing.T) {
 	st.set(nil, errors.New("db down"))
 	eventually(t, func() bool { return s.Healthy() != nil }, "should become unhealthy when reloads keep failing")
 }
+
+func TestOnResultGetsSavedResults(t *testing.T) {
+	st := &fakeStore{checks: []check.Check{ck(1)}}
+	var calls atomic.Int32
+	s := New(st, &fakeRunner{}, quietLog(), Options{
+		ReloadInterval: time.Hour, IntervalUnit: time.Millisecond,
+		OnResult: func(_ context.Context, c check.Check, res check.Result) {
+			if c.ID == 1 && res.CheckID == 1 {
+				calls.Add(1)
+			}
+		},
+	})
+	stop := start(t, s)
+	defer stop()
+	eventually(t, func() bool { return calls.Load() >= 2 }, "OnResult was not called for saved results")
+}

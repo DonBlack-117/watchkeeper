@@ -4,6 +4,7 @@ import type {
   CheckPatch,
   FieldError,
   HourLatency,
+  Incident,
   Me,
   PublicStatus,
   Summary,
@@ -127,6 +128,10 @@ export const api = {
     request<Check>("PATCH", `/api/v1/checks/${id}`, input),
   deleteCheck: (id: number) =>
     request<undefined>("DELETE", `/api/v1/checks/${id}`),
+
+  incidents: (signal?: AbortSignal) =>
+    request<Incident[]>("GET", "/api/v1/incidents?limit=10", undefined, signal),
+  testAlert: () => request<undefined>("POST", "/api/v1/alerts/test"),
 
   status: (signal?: AbortSignal) =>
     request<PublicStatus>("GET", "/api/v1/status", undefined, signal),

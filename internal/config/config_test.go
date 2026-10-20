@@ -71,3 +71,30 @@ func TestTrustedProxies(t *testing.T) {
 		t.Fatal("want an error for a bad proxy")
 	}
 }
+
+func TestTelegramAndMetricsSettings(t *testing.T) {
+	t.Setenv("WK_TELEGRAM_BOT_TOKEN", "123456789:AAH-abcdefghijklmnopqrstuvwxyz0123456")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WK_TELEGRAM_CHAT_ID") {
+		t.Fatalf("token without chat id: %v", err)
+	}
+	t.Setenv("WK_TELEGRAM_CHAT_ID", "-1001234567890")
+	t.Setenv("WK_METRICS_ADDR", "127.0.0.1:9464")
+	t.Setenv("WK_PUBLIC_URL", "https://wk.example.com")
+	c, err := Load()
+	if err != nil || c.TelegramChatID != "-1001234567890" || c.MetricsAddr != "127.0.0.1:9464" {
+		t.Fatalf("valid settings: %+v %v", c, err)
+	}
+	for k, v := range map[string]string{
+		"WK_TELEGRAM_BOT_TOKEN": "not-a-token",
+		"WK_TELEGRAM_CHAT_ID":   "chat; drop",
+		"WK_METRICS_ADDR":       "127.0.0.1:8090", // same as WK_ADDR
+		"WK_PUBLIC_URL":         "javascript:alert(1)",
+	} {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv(k, v)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), k) {
+				t.Fatalf("%s=%q accepted: %v", k, v, err)
+			}
+		})
+	}
+}

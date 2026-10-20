@@ -14,7 +14,7 @@ db:
 
 # Local development: allow checks against localhost (the other projects run there).
 run:
-	WK_ALLOW_PRIVATE_TARGETS=true go run ./cmd/watchkeeper
+	WK_ALLOW_PRIVATE_TARGETS=true WK_METRICS_ADDR=127.0.0.1:9464 go run ./cmd/watchkeeper
 
 test:
 	go test -race ./...

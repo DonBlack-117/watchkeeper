@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -281,5 +282,118 @@ func TestUsersAndSessions(t *testing.T) {
 	}
 	if _, err := s.SessionUser(ctx, live, now); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted session: %v", err)
+	}
+}
+
+func TestIncidentLifecycle(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	a, err := s.CreateCheck(ctx, sample("api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	step := func(st check.Status, minute int, errText string, want TransitionKind) Incident {
+		t.Helper()
+		tr, err := s.ApplyStatus(ctx, a.ID, st, t0.Add(time.Duration(minute)*time.Minute), errText)
+		if err != nil || tr.Kind != want {
+			t.Fatalf("%s at +%d min: kind %v, want %v (%v)", st, minute, tr.Kind, want, err)
+		}
+		return tr.Incident
+	}
+
+	step(check.StatusOperational, 0, "", NoChange)
+	step(check.StatusUnknown, 1, "", NoChange)
+	opened := step(check.StatusDegraded, 2, "timeout", Opened)
+	if opened.CheckName != "api" || !opened.StartedAt.Equal(t0.Add(2*time.Minute)) {
+		t.Fatalf("opened: %+v", opened)
+	}
+	step(check.StatusDegraded, 3, "timeout", NoChange)
+	step(check.StatusDown, 4, "connection refused", Changed)
+	if err := s.MarkNotified(ctx, opened.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.CountOpenIncidents(ctx); err != nil || n != 1 {
+		t.Fatalf("open = %d %v", n, err)
+	}
+	resolved := step(check.StatusOperational, 10, "", Resolved)
+	if !resolved.Notified || resolved.ResolvedAt == nil || resolved.ResolvedAt.Sub(resolved.StartedAt) != 8*time.Minute {
+		t.Fatalf("resolved: %+v", resolved)
+	}
+	second := step(check.StatusDown, 20, "timeout", Opened)
+	if second.ID == opened.ID || second.Notified {
+		t.Fatalf("a new incident must start fresh: %+v", second)
+	}
+
+	all, err := s.ListIncidents(ctx, IncidentQuery{})
+	if err != nil || len(all) != 2 || all[0].ID != second.ID {
+		t.Fatalf("list newest first: %+v %v", all, err)
+	}
+	first := all[1]
+	var timeline []string
+	for _, u := range first.Updates {
+		timeline = append(timeline, u.Status+":"+u.Error)
+	}
+	if got := strings.Join(timeline, ","); got != "degraded:timeout,down:connection refused,resolved:" {
+		t.Fatalf("timeline = %s", got)
+	}
+	open, err := s.ListIncidents(ctx, IncidentQuery{OpenOnly: true})
+	if err != nil || len(open) != 1 || open[0].ID != second.ID {
+		t.Fatalf("open only: %+v %v", open, err)
+	}
+	recent, err := s.ListIncidents(ctx, IncidentQuery{Since: t0.Add(15 * time.Minute)})
+	if err != nil || len(recent) != 1 {
+		t.Fatalf("since must skip incidents resolved before it: %+v %v", recent, err)
+	}
+
+	exp := t0.Add(20 * 24 * time.Hour)
+	if fresh, err := s.RecordCertNotice(ctx, a.ID, exp, 30); err != nil || !fresh {
+		t.Fatalf("first notice: %v %v", fresh, err)
+	}
+	if fresh, _ := s.RecordCertNotice(ctx, a.ID, exp, 30); fresh {
+		t.Fatal("the same notice must be recorded once")
+	}
+	if fresh, _ := s.RecordCertNotice(ctx, a.ID, exp, 14); !fresh {
+		t.Fatal("a new threshold is a new notice")
+	}
+
+	recentRuns, err := s.RecentResultsFor(ctx, a.ID, 3, time.Time{})
+	if err != nil || len(recentRuns) != 0 {
+		t.Fatalf("no runs yet: %v %v", recentRuns, err)
+	}
+	for _, at := range []time.Time{t0, t0.Add(time.Hour)} {
+		if _, err := s.SaveResult(ctx, check.Result{CheckID: a.ID, StartedAt: at, OK: true, TotalMS: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rs, _ := s.RecentResultsFor(ctx, a.ID, 3, t0.Add(30*time.Minute)); len(rs) != 1 {
+		t.Fatalf("since must drop runs before the last edit: %d", len(rs))
+	}
+
+	// An overlapping older run must not resolve before the incident started.
+	tr, err := s.ApplyStatus(ctx, a.ID, check.StatusOperational, t0, "")
+	if err != nil || tr.Kind != Resolved || !tr.Incident.ResolvedAt.Equal(second.StartedAt) {
+		t.Fatalf("clamped resolve: %+v %v", tr, err)
+	}
+	step(check.StatusDown, 30, "timeout", Opened)
+	if closed, err := s.ResolveOpen(ctx, a.ID, t0.Add(31*time.Minute)); err != nil || !closed {
+		t.Fatalf("resolve open: %v %v", closed, err)
+	}
+	if closed, _ := s.ResolveOpen(ctx, a.ID, t0.Add(32*time.Minute)); closed {
+		t.Fatal("nothing left to resolve")
+	}
+	off := a
+	off.Enabled = false
+	if _, err := s.UpdateCheck(ctx, off); err != nil {
+		t.Fatal(err)
+	}
+	if pub, _ := s.ListIncidents(ctx, IncidentQuery{EnabledOnly: true}); len(pub) != 0 {
+		t.Fatalf("incidents of disabled checks must be filtered: %d", len(pub))
+	}
+	if err := s.DeleteCheck(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountOpenIncidents(ctx); n != 0 {
+		t.Fatal("deleting a check must delete its incidents")
 	}
 }

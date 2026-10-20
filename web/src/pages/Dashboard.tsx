@@ -5,6 +5,7 @@ import {
   LogOut,
   Pencil,
   Plus,
+  Send,
   Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -17,6 +18,7 @@ import { BarsLegend, UptimeBars } from "../components/UptimeBars";
 import { ago, ms, percent } from "../format";
 import type { Check } from "../types";
 import { usePoll } from "../usePoll";
+import { IncidentList } from "../components/IncidentList";
 
 const REFRESH_MS = 30_000;
 const EMPTY_DAYS: null[] = Array<null>(90).fill(null);
@@ -30,6 +32,8 @@ export function Dashboard({
 }) {
   const checks = usePoll(api.checks, REFRESH_MS);
   const summary = usePoll(api.summary, REFRESH_MS);
+  const incidentPoll = usePoll(api.incidents, REFRESH_MS);
+  const [testing, setTesting] = useState(false);
   const [selectedId, setSelectedId] = useState<number>();
   const [editing, setEditing] = useState<Check | "new">();
   const [deleting, setDeleting] = useState<Check>();
@@ -70,11 +74,13 @@ export function Dashboard({
   const { reload: reloadChecks } = checks;
   const { reload: reloadSummary } = summary;
   const { reload: reloadLatency } = latency;
+  const { reload: reloadIncidents } = incidentPoll;
   const reloadAll = useCallback(() => {
     reloadChecks();
     reloadSummary();
     reloadLatency();
-  }, [reloadChecks, reloadSummary, reloadLatency]);
+    reloadIncidents();
+  }, [reloadChecks, reloadSummary, reloadLatency, reloadIncidents]);
 
   const remove = async () => {
     if (!deleting) return;
@@ -111,7 +117,23 @@ export function Dashboard({
     : undefined;
 
   const s = summary.data;
-  const incidents = s ? s.down + s.degraded : undefined;
+  const alertsOn = (s?.alertChannels.length ?? 0) > 0;
+
+  const testAlert = async () => {
+    setTesting(true);
+    try {
+      await api.testAlert();
+      setToast("Test alert sent. Check the Telegram chat.");
+    } catch (e) {
+      setToast(
+        e instanceof Error
+          ? `Test alert failed: ${e.message}`
+          : "Test alert failed.",
+      );
+    } finally {
+      setTesting(false);
+    }
+  };
 
   return (
     <div className="shell app-bg">
@@ -187,7 +209,7 @@ export function Dashboard({
             </div>
             <div className="card kpi">
               <dt>Open incidents</dt>
-              <dd>{incidents ?? "…"}</dd>
+              <dd>{s ? s.openIncidents : "…"}</dd>
               <dd className="kpi-note">
                 {s ? `${s.down} down, ${s.degraded} degraded` : ""}
               </dd>
@@ -240,6 +262,51 @@ export function Dashboard({
               )
             ) : (
               <p className="empty">Create a check to see its response time.</p>
+            )}
+          </div>
+        </section>
+
+        <section className="card" aria-labelledby="incidents-title">
+          <div className="card-head">
+            <h2 id="incidents-title">Incidents</h2>
+            {s && (
+              <div className="check-row">
+                <span className="subtle" style={{ fontSize: 12 }}>
+                  {alertsOn
+                    ? `Alerts: ${s.alertChannels.join(", ")}`
+                    : "Alerts off: set WK_TELEGRAM_BOT_TOKEN"}
+                </span>
+                {alertsOn && (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void testAlert()}
+                    disabled={testing}
+                  >
+                    <Send size={14} aria-hidden="true" />
+                    {testing ? "Sending…" : "Send test alert"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <div style={{ marginTop: 8 }}>
+            {incidentPoll.error && !incidentPoll.data ? (
+              <p className="alert" role="alert" style={{ margin: 18 }}>
+                Could not load incidents: {incidentPoll.error.message}
+              </p>
+            ) : incidentPoll.data ? (
+              <IncidentList
+                incidents={incidentPoll.data.map((i) => ({
+                  ...i,
+                  name: i.checkName,
+                }))}
+                empty="No incidents yet."
+              />
+            ) : (
+              <p className="empty" aria-busy="true">
+                Loading incidents…
+              </p>
             )}
           </div>
         </section>

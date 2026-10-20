@@ -1,0 +1,85 @@
+# Watchkeeper alerts about the checks itself; Grafana alerts about Watchkeeper:
+# if the service stops, it cannot report its own outage.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: telegram
+    receivers:
+      - uid: wk-telegram
+        type: telegram
+        settings:
+          bottoken: $WK_TELEGRAM_BOT_TOKEN
+          chatid: "$WK_TELEGRAM_CHAT_ID"
+          parse_mode: HTML
+
+policies:
+  - orgId: 1
+    receiver: telegram
+    group_by: ["alertname"]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+
+groups:
+  - orgId: 1
+    name: watchkeeper
+    folder: Watchkeeper
+    interval: 1m
+    rules:
+      - uid: wk-unreachable
+        title: Watchkeeper is not reachable
+        condition: C
+        for: 2m
+        noDataState: Alerting
+        execErrState: Alerting
+        annotations:
+          summary: Prometheus cannot scrape Watchkeeper, so no check is being monitored.
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: A
+              expr: max(up{job="watchkeeper"})
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+      - uid: wk-save-failures
+        title: Watchkeeper cannot save results
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Alerting
+        annotations:
+          summary: Several check results in a row could not be written to PostgreSQL.
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: A
+              expr: max(watchkeeper_scheduler_save_failures)
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [2]

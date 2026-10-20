@@ -17,6 +17,9 @@ import (
 	"github.com/DonBlack-117/watchkeeper/internal/api"
 	"github.com/DonBlack-117/watchkeeper/internal/check"
 	"github.com/DonBlack-117/watchkeeper/internal/config"
+	"github.com/DonBlack-117/watchkeeper/internal/incident"
+	"github.com/DonBlack-117/watchkeeper/internal/metrics"
+	"github.com/DonBlack-117/watchkeeper/internal/notify"
 	"github.com/DonBlack-117/watchkeeper/internal/scheduler"
 	"github.com/DonBlack-117/watchkeeper/internal/store"
 	"github.com/DonBlack-117/watchkeeper/internal/ui"
@@ -27,6 +30,8 @@ const (
 	shutdownTimeout = 15 * time.Second
 	pruneEvery      = time.Hour
 	pruneBatch      = 5000
+	alertDrain      = 10 * time.Second
+	incidentTimeout = 10 * time.Second
 )
 
 func main() {
@@ -70,9 +75,33 @@ func run() error {
 		log.Info("dashboard account ready", "user", cfg.AdminUser)
 	}
 
-	sched := scheduler.New(st, check.NewRunner(cfg.AllowPrivate), log, scheduler.Options{
+	// The metrics read the scheduler, which reports to the metrics: build the
+	// metrics first with closures over the scheduler variable.
+	var sched *scheduler.Scheduler
+	m := metrics.New(metrics.Sources{
+		Running:       func() []int64 { return sched.Running() },
+		SaveFailures:  func() int64 { return sched.SaveFailures() },
+		OpenIncidents: st.CountOpenIncidents,
+	})
+	var notifiers []notify.Notifier
+	if cfg.TelegramToken != "" {
+		notifiers = append(notifiers, notify.NewTelegram(cfg.TelegramToken, cfg.TelegramChatID))
+	}
+	alerts := notify.NewDispatcher(log, m, notifiers...)
+	incidents := incident.New(st, alerts, log, incident.Options{
+		AlertOnDegraded: cfg.AlertOnDegraded,
+		PublicURL:       cfg.PublicURL,
+	})
+	sched = scheduler.New(st, check.NewRunner(cfg.AllowPrivate), log, scheduler.Options{
 		MaxConcurrent:  cfg.MaxConcurrent,
 		ReloadInterval: cfg.ReloadInterval,
+		OnResult: func(ctx context.Context, c check.Check, res check.Result) {
+			m.ObserveRun(c, res)
+			// Its own budget: incidents take a few queries after the save.
+			ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), incidentTimeout)
+			defer cancel()
+			incidents.Process(ictx, c, res)
+		},
 	})
 	handler := api.New(st, log, api.Options{
 		Token:          cfg.APIToken,
@@ -83,6 +112,8 @@ func run() error {
 		SecureCookie:   cfg.SecureCookie,
 		TrustedProxies: cfg.TrustedProxies,
 		Frontend:       ui.Handler(),
+		Metrics:        m,
+		Alerts:         alerts,
 	}).Handler()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -94,19 +125,38 @@ func run() error {
 		MaxHeaderBytes:    64 << 10,
 	}
 
-	errc := make(chan error, 1)
+	errc := make(chan error, 2) // API and metrics servers
 	schedDone := make(chan struct{})
 	go func() {
 		defer close(schedDone)
 		_ = sched.Run(ctx) // returns when ctx is cancelled; problems surface through /health
 	}()
+	// Alerts stop after the checks, so the alerts of their last runs are queued.
+	alertsCtx, stopAlerts := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopAlerts()
+	go alerts.Run(alertsCtx, alertDrain)
 	go prune(ctx, st, cfg.RetentionDays, log)
 	go func() {
-		log.Info("listening", "addr", cfg.Addr, "token", cfg.APIToken != "", "login", cfg.AdminUser != "", "retention_days", cfg.RetentionDays)
+		log.Info("listening", "addr", cfg.Addr, "token", cfg.APIToken != "", "login", cfg.AdminUser != "",
+			"retention_days", cfg.RetentionDays, "alerts", alerts.Channels(), "metrics", cfg.MetricsAddr)
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errc <- fmt.Errorf("http server: %w", err)
 		}
 	}()
+	// /metrics has its own listener so it is never reachable through the public
+	// port; in production only Prometheus on the internal network can reach it.
+	var metricsSrv *http.Server
+	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", m.Handler())
+		metricsSrv = &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("metrics server: %w", err)
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -121,10 +171,19 @@ func run() error {
 	if serr := srv.Shutdown(shutdownCtx); serr != nil {
 		err = errors.Join(err, fmt.Errorf("http shutdown: %w", serr))
 	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
+	}
 	select {
 	case <-schedDone:
 	case <-shutdownCtx.Done():
 		err = errors.Join(err, errors.New("checks still running after the shutdown timeout"))
+	}
+	// Alerts queued by the last runs still go out, within alertDrain.
+	stopAlerts()
+	select {
+	case <-alerts.Done():
+	case <-shutdownCtx.Done():
 	}
 	return err
 }

@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/DonBlack-117/watchkeeper/internal/check"
+	"github.com/DonBlack-117/watchkeeper/internal/notify"
 	"github.com/DonBlack-117/watchkeeper/internal/store"
 )
 
@@ -28,6 +30,7 @@ type memStore struct {
 	pingErr  error
 
 	sessionLookups int
+	incidents      []store.Incident
 }
 
 type memSession struct {
@@ -199,6 +202,43 @@ func (m *memStore) DeleteSession(_ context.Context, hash []byte) error {
 	defer m.mu.Unlock()
 	delete(m.sessions, string(hash))
 	return nil
+}
+
+func (m *memStore) ListIncidents(_ context.Context, q store.IncidentQuery) ([]store.Incident, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []store.Incident{}
+	for _, inc := range m.incidents {
+		if q.EnabledOnly && !m.checks[inc.CheckID].Enabled {
+			continue
+		}
+		if (q.CheckID == 0 || inc.CheckID == q.CheckID) && (!q.OpenOnly || inc.ResolvedAt == nil) {
+			out = append(out, inc)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) ResolveOpen(_ context.Context, checkID int64, at time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.incidents {
+		if m.incidents[i].CheckID == checkID && m.incidents[i].ResolvedAt == nil {
+			m.incidents[i].ResolvedAt = &at
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *memStore) CountOpenIncidents(context.Context) (int, error) {
+	n := 0
+	for _, inc := range m.incidents {
+		if inc.ResolvedAt == nil {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func newServer(m *memStore) http.Handler { return newServerWith(m, Options{}) }
@@ -506,5 +546,140 @@ func TestPatchClearsExpectedStatus(t *testing.T) {
 	}
 	if _, ok := body["data"].(map[string]any)["expectedStatus"]; ok {
 		t.Fatalf("null must clear expectedStatus: %v", body)
+	}
+}
+
+func sampleIncidents() []store.Incident {
+	t0 := time.Date(2026, 10, 19, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(30 * time.Minute)
+	return []store.Incident{
+		{ID: 2, CheckID: 1, CheckName: "btc API", Status: check.StatusDown, StartedAt: t1,
+			Updates: []store.IncidentUpdate{{At: t1, Status: "down", Error: "dial 10.0.0.5: timeout"}}},
+		{ID: 1, CheckID: 1, CheckName: "btc API", Status: check.StatusDegraded, StartedAt: t0, ResolvedAt: &t1,
+			Updates: []store.IncidentUpdate{{At: t0, Status: "degraded", Error: "timeout"}, {At: t1, Status: "resolved"}}},
+	}
+}
+
+func TestIncidentsEndpointAndPublicStatus(t *testing.T) {
+	m := newMem()
+	h := newServer(m)
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	m.incidents = sampleIncidents()
+
+	_, body := do(t, h, "GET", "/api/v1/incidents?open=true", "")
+	list := body["data"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["updates"].([]any)[0].(map[string]any)["error"] == nil {
+		t.Fatalf("the dashboard sees open incidents with errors: %v", list)
+	}
+	for _, bad := range []string{"limit=0", "checkId=x", "open=maybe"} {
+		if rec, _ := do(t, h, "GET", "/api/v1/incidents?"+bad, ""); rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("%s: status = %d", bad, rec.Code)
+		}
+	}
+
+	rec, body := do(t, h, "GET", "/api/v1/status", "")
+	public := body["data"].(map[string]any)["incidents"].([]any)
+	if len(public) != 2 || strings.Contains(rec.Body.String(), "10.0.0.5") || strings.Contains(rec.Body.String(), "timeout") {
+		t.Fatalf("the status page must list incidents without errors: %s", rec.Body)
+	}
+
+	_, body = do(t, h, "GET", "/api/v1/summary", "")
+	if body["data"].(map[string]any)["openIncidents"].(float64) != 1 {
+		t.Errorf("summary: %v", body["data"])
+	}
+}
+
+type fakeAlerts struct {
+	channels []string
+	err      error
+	sent     []string
+}
+
+func (f *fakeAlerts) Channels() []string { return f.channels }
+func (f *fakeAlerts) SendNow(_ context.Context, m notify.Message) error {
+	f.sent = append(f.sent, m.Text)
+	return f.err
+}
+
+func TestTestAlert(t *testing.T) {
+	if rec, _ := do(t, newServer(newMem()), "POST", "/api/v1/alerts/test", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("without channels: %d", rec.Code)
+	}
+	a := &fakeAlerts{channels: []string{"telegram"}}
+	h := newServerWith(newMem(), Options{Alerts: a})
+	if rec, _ := do(t, h, "POST", "/api/v1/alerts/test", ""); rec.Code != http.StatusNoContent || len(a.sent) != 1 {
+		t.Fatalf("test alert: %d %v", rec.Code, a.sent)
+	}
+	a.err = &notify.Permanent{Err: errors.New("telegram: 401 Unauthorized")}
+	rec, body := do(t, h, "POST", "/api/v1/alerts/test", "")
+	if rec.Code != http.StatusBadGateway || !strings.Contains(body["detail"].(string), "bot token") {
+		t.Fatalf("failed test alert: %d %v", rec.Code, body)
+	}
+	_, body = do(t, h, "GET", "/api/v1/summary", "")
+	if ch := body["data"].(map[string]any)["alertChannels"].([]any); len(ch) != 1 || ch[0] != "telegram" {
+		t.Errorf("summary channels: %v", ch)
+	}
+	for range 5 {
+		do(t, h, "POST", "/api/v1/alerts/test", "")
+	}
+	if rec, _ := do(t, h, "POST", "/api/v1/alerts/test", ""); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("test alerts must be rate limited, got %d", rec.Code)
+	}
+}
+
+type routes struct{ got []string }
+
+func (r *routes) ObserveHTTP(route, method string, code int, _ time.Duration) {
+	r.got = append(r.got, route+" "+method+" "+strconv.Itoa(code))
+}
+
+func TestHTTPMetricsUseRoutePatterns(t *testing.T) {
+	obs := &routes{}
+	front := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") })
+	h := newServerWith(newMem(), Options{Metrics: obs, Frontend: front})
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	do(t, h, "GET", "/api/v1/checks/1", "")
+	do(t, h, "GET", "/api/v1/checks/999/uptime", "")
+	do(t, h, "GET", "/status", "")
+	want := []string{"POST /api/v1/checks POST 201", "GET /api/v1/checks/{id} GET 200", "GET /api/v1/checks/{id}/uptime GET 404", "frontend GET 200"}
+	if strings.Join(obs.got, "|") != strings.Join(want, "|") {
+		t.Fatalf("routes:\n got %v\nwant %v", obs.got, want)
+	}
+}
+
+func TestDisablingACheckResolvesItsIncident(t *testing.T) {
+	m := newMem()
+	h := newServer(m)
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	m.incidents = sampleIncidents()
+	do(t, h, "PATCH", "/api/v1/checks/1", `{"name":"renamed"}`)
+	if n, _ := m.CountOpenIncidents(context.Background()); n != 1 {
+		t.Fatal("a rename must keep the incident open")
+	}
+	_, body := do(t, h, "GET", "/api/v1/status", "")
+	if len(body["data"].(map[string]any)["incidents"].([]any)) != 2 {
+		t.Fatal("incidents of enabled checks are public")
+	}
+	do(t, h, "PATCH", "/api/v1/checks/1", `{"enabled":false}`)
+	if n, _ := m.CountOpenIncidents(context.Background()); n != 0 {
+		t.Fatal("disabling a check must resolve its incident")
+	}
+	h = newServer(m) // fresh status cache
+	_, body = do(t, h, "GET", "/api/v1/status", "")
+	if len(body["data"].(map[string]any)["incidents"].([]any)) != 0 {
+		t.Fatal("incidents of disabled checks must not be public")
+	}
+}
+
+func TestMethodLabelIsBounded(t *testing.T) {
+	obs := &routes{}
+	h := newServerWith(newMem(), Options{Metrics: obs})
+	for _, m := range []string{"FOO1", "FOO2", "PROPFIND"} {
+		send(h, m, "/api/v1/checks", "", nil)
+	}
+	for _, got := range obs.got {
+		if !strings.Contains(got, " OTHER ") {
+			t.Fatalf("unknown methods must share one label: %v", obs.got)
+		}
 	}
 }

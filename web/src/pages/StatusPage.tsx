@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { api } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
 import { BarsLegend, UptimeBars } from "../components/UptimeBars";
+import { IncidentList } from "../components/IncidentList";
 import { ago, overallLabel, percent } from "../format";
 import { usePoll } from "../usePoll";
 
@@ -82,6 +83,21 @@ export function StatusPage() {
               </div>
             </section>
             <BarsLegend />
+
+            <section className="card" aria-labelledby="incidents-title">
+              <div className="card-head">
+                <h2 id="incidents-title">Incidents</h2>
+                <span className="subtle" style={{ fontSize: 12 }}>
+                  Last 14 days
+                </span>
+              </div>
+              <div style={{ paddingTop: 8 }}>
+                <IncidentList
+                  incidents={data.incidents}
+                  empty="No incidents in the last 14 days."
+                />
+              </div>
+            </section>
           </>
         )}
         <footer className="subtle" style={{ fontSize: 12 }}>

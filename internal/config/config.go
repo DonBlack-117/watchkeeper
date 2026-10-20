@@ -7,10 +7,14 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/DonBlack-117/watchkeeper/internal/notify"
 )
 
 // DefaultDatabaseURL is the local docker-compose database; production must override it.
@@ -31,6 +35,12 @@ type Config struct {
 	AdminPassword  string         // WK_ADMIN_PASSWORD
 	SecureCookie   bool           // WK_COOKIE_SECURE: default true unless Addr is loopback
 	TrustedProxies []netip.Prefix // WK_TRUSTED_PROXIES: comma-separated CIDRs or IPs
+
+	TelegramToken   string // WK_TELEGRAM_BOT_TOKEN: from @BotFather
+	TelegramChatID  string // WK_TELEGRAM_CHAT_ID: user, group or channel id
+	AlertOnDegraded bool   // WK_ALERT_ON_DEGRADED: also alert when a check is only degraded
+	PublicURL       string // WK_PUBLIC_URL: dashboard link added to alerts
+	MetricsAddr     string // WK_METRICS_ADDR: Prometheus /metrics listener; empty disables it
 }
 
 // Load reads the environment. It listens on localhost by default and refuses to
@@ -42,6 +52,10 @@ func Load() (Config, error) {
 		APIToken:       os.Getenv("WK_API_TOKEN"),
 		AdminUser:      os.Getenv("WK_ADMIN_USER"),
 		AdminPassword:  os.Getenv("WK_ADMIN_PASSWORD"),
+		TelegramToken:  os.Getenv("WK_TELEGRAM_BOT_TOKEN"),
+		TelegramChatID: os.Getenv("WK_TELEGRAM_CHAT_ID"),
+		PublicURL:      os.Getenv("WK_PUBLIC_URL"),
+		MetricsAddr:    os.Getenv("WK_METRICS_ADDR"),
 		ReloadInterval: 30 * time.Second,
 	}
 	var errs []error
@@ -91,8 +105,35 @@ func Load() (Config, error) {
 	if c.TrustedProxies, err = prefixes(os.Getenv("WK_TRUSTED_PROXIES")); err != nil {
 		errs = append(errs, err)
 	}
+	if (c.TelegramToken == "") != (c.TelegramChatID == "") {
+		errs = append(errs, errors.New("set both WK_TELEGRAM_BOT_TOKEN and WK_TELEGRAM_CHAT_ID, or neither"))
+	}
+	if c.TelegramToken != "" && !notify.ValidTelegramToken(c.TelegramToken) {
+		errs = append(errs, errors.New("WK_TELEGRAM_BOT_TOKEN does not look like a bot token (<digits>:<secret>)"))
+	}
+	if c.TelegramChatID != "" && !chatID.MatchString(c.TelegramChatID) {
+		errs = append(errs, errors.New("WK_TELEGRAM_CHAT_ID must be a numeric id (negative for groups) or @channelname"))
+	}
+	if c.AlertOnDegraded, err = boolEnv("WK_ALERT_ON_DEGRADED", false); err != nil {
+		errs = append(errs, err)
+	}
+	if c.PublicURL != "" {
+		if u, err := url.Parse(c.PublicURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("WK_PUBLIC_URL must be an absolute http or https URL, got %q", c.PublicURL))
+		}
+	}
+	if c.MetricsAddr != "" {
+		if _, _, err := net.SplitHostPort(c.MetricsAddr); err != nil {
+			errs = append(errs, fmt.Errorf("WK_METRICS_ADDR must be host:port, got %q", c.MetricsAddr))
+		} else if c.MetricsAddr == c.Addr {
+			errs = append(errs, errors.New("WK_METRICS_ADDR must differ from WK_ADDR, so /metrics stays off the public port"))
+		}
+	}
 	return c, errors.Join(errs...)
 }
+
+// chatID accepts a numeric chat id (negative for groups) or a public @channel.
+var chatID = regexp.MustCompile(`^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$`)
 
 // IsLoopback reports whether addr (host:port) only accepts local connections.
 func IsLoopback(addr string) bool {

@@ -65,6 +65,35 @@ export const checks = [
   },
 ];
 
+const hoursAgo = (h: number) => new Date(now - h * 3_600_000).toISOString();
+
+export const incidents = [
+  {
+    id: 2,
+    checkId: 2,
+    checkName: "donblack.dev TLS",
+    status: "down",
+    startedAt: hoursAgo(2),
+    resolvedAt: null,
+    updates: [
+      { at: hoursAgo(2), status: "degraded", error: "timeout" },
+      { at: hoursAgo(1.9), status: "down", error: "timeout" },
+    ],
+  },
+  {
+    id: 1,
+    checkId: 1,
+    checkName: "Bitso API",
+    status: "degraded",
+    startedAt: hoursAgo(50),
+    resolvedAt: hoursAgo(49.6),
+    updates: [
+      { at: hoursAgo(50), status: "degraded", error: "HTTP 503" },
+      { at: hoursAgo(49.6), status: "resolved" },
+    ],
+  },
+];
+
 const json = (route: Route, status: number, data?: unknown) =>
   route.fulfill({
     status,
@@ -128,9 +157,15 @@ export async function mockApi(page: Page, opts: { signedIn?: boolean } = {}) {
         created.push(c);
         return json(route, 201, { data: c });
       }
+      case "GET /api/v1/incidents":
+        return json(route, 200, { data: incidents });
+      case "POST /api/v1/alerts/test":
+        return route.fulfill({ status: 204 });
       case "GET /api/v1/summary":
         return json(route, 200, {
           data: {
+            openIncidents: 1,
+            alertChannels: ["telegram"],
             checks: 2 + created.length,
             enabled: 2,
             operational: 1,
@@ -155,6 +190,11 @@ export async function mockApi(page: Page, opts: { signedIn?: boolean } = {}) {
               uptime90: c.uptime90,
               lastCheckedAt: null,
               daily: c.daily,
+            })),
+            incidents: incidents.map(({ checkName, updates, ...i }) => ({
+              ...i,
+              name: checkName,
+              updates: updates.map(({ at, status }) => ({ at, status })),
             })),
           },
         });

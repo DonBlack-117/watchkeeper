@@ -4,13 +4,15 @@
 
 Uptime monitor and status page with AI incident triage, written in Go.
 
-Watchkeeper checks your HTTP endpoints, DNS records and TLS certificates on a schedule, stores every run in PostgreSQL, and shows the results in a React dashboard and a public status page. It ships as one 16 MB container image and deploys to AWS from GitHub Actions. Later phases add Prometheus metrics and an agent that uses Claude to investigate incidents.
+Watchkeeper checks your HTTP endpoints, DNS records and TLS certificates on a schedule, stores every run in PostgreSQL, and shows the results in a React dashboard and a public status page. It opens an incident when a service goes down, alerts you on Telegram, and exports Prometheus metrics and JSON logs to a Grafana dashboard with Loki. It ships as one container image and deploys to AWS from GitHub Actions. The last phase adds an agent that uses Claude to investigate incidents.
 
-> **Status:** phases 1 (Go core) and 2 (dashboard and deployment) are done. See the [roadmap](#roadmap).
+> **Status:** phases 1 (Go core), 2 (dashboard and deployment) and 3 (incidents, alerts and observability) are done. See the [roadmap](#roadmap).
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
 ![Public status page](docs/screenshots/status.png)
+
+![Grafana dashboard](docs/screenshots/grafana.png)
 
 ## Features
 
@@ -23,6 +25,10 @@ Watchkeeper checks your HTTP endpoints, DNS records and TLS certificates on a sc
 - **Dashboard** in React and strict TypeScript: availability, p95 latency, open incidents, p50/p95 response time per hour, 90-day bars per service, and a form to create, edit and delete checks.
 - **Public status page** at `/status`, light themed, with 90 days of history per service.
 - **Single binary:** the frontend is embedded with `go:embed`, so the image has no web server of its own.
+- **Incidents:** opened when a check stops being operational, escalated from degraded to down, and resolved on recovery, with a timeline shown in the dashboard and, without error details, on the status page.
+- **Telegram alerts** when a check goes down and when it recovers (with the duration), and 30 and 14 days before a certificate expires. Short blips never alert, delivery is queued with retries, and the dashboard has a "Send test alert" button.
+- **Prometheus metrics** on a separate internal port: check status, phase durations, API traffic and latency, alerts, incidents and Go runtime.
+- **Grafana and Loki** in an optional Compose profile, with the data sources, a dashboard and alert rules provisioned from the repository. Grafana alerts on Telegram if Watchkeeper itself stops.
 
 ## Quick start
 
@@ -61,6 +67,8 @@ Settings come from environment variables; see [`.env.example`](.env.example).
 | `POST /api/v1/auth/login`                                  | Dashboard login; sets the session cookie                         |
 | `POST /api/v1/auth/logout`                                 | Ends the session                                                 |
 | `GET /api/v1/auth/me`                                      | Whether a login is required and who is signed in                 |
+| `GET /api/v1/incidents?limit=&checkId=&open=`              | Incidents newest first, each with its timeline                   |
+| `POST /api/v1/alerts/test`                                 | Sends a test message to every alert channel                      |
 
 Create a check:
 
@@ -113,21 +121,41 @@ internal/check/      check types, validation, status rules and runners
 internal/scheduler/  one goroutine per check, reloads the list every 30 s
 internal/store/      PostgreSQL with pgx; embedded goose migrations
 internal/api/        REST handlers, sessions, problem details and request logging
+internal/incident/   incident state machine, alert messages and certificate warnings
+internal/notify/     alert queue with retries; Telegram Bot API client
+internal/metrics/    Prometheus registry and per-check collectors
 internal/ui/         embeds the built frontend and serves it with SPA fallback
 migrations/          SQL migrations
 web/                 React + TypeScript dashboard and status page (Vite)
-deploy/              production Compose stack, Caddyfile and EC2 user data
+deploy/              production Compose stack, Caddyfile, EC2 user data and the
+                     observability profile (Prometheus, Loki, Alloy, Grafana)
 ```
 
 ## Deployment
 
 `Dockerfile` builds the frontend with Node, cross-compiles Go for amd64 and arm64, and copies the binary into a distroless non-root image. On every push to `main` that passes CI, the `Deploy` workflow publishes `ghcr.io/donblack-117/watchkeeper` and, once the server is configured, rolls it out to EC2 over SSH and waits for `/api/v1/health`. The server runs the app, PostgreSQL and Caddy (automatic HTTPS) with Docker Compose. Step-by-step setup: [docs/deploy.md](docs/deploy.md).
 
+## Observability
+
+| Signal  | Where                                                                                                 |
+| ------- | ----------------------------------------------------------------------------------------------------- |
+| Metrics | `GET /metrics` on `WK_METRICS_ADDR` (internal port 9464 in Compose), scraped by Prometheus every 15 s |
+| Logs    | JSON from `log/slog` on stdout; Alloy ships them to Loki with the `service` and `level` labels        |
+| Alerts  | Watchkeeper sends incident and certificate alerts; Grafana alerts when Watchkeeper is unreachable     |
+
+Main metrics: `watchkeeper_check_up`, `watchkeeper_check_phase_duration_seconds` (histogram by phase), `watchkeeper_check_runs_total`, `watchkeeper_check_cert_expiry_timestamp_seconds`, `watchkeeper_http_requests_total` and `watchkeeper_http_request_duration_seconds` (by route pattern), `watchkeeper_incidents_open` and `watchkeeper_notifications_total`.
+
+```bash
+docker compose --profile observability up -d   # on the server, see docs/deploy.md
+```
+
+Grafana is served at `https://grafana.<domain>`, a separate origin from the dashboard, with its own admin account. Alloy reads container logs through a socket proxy that only allows read-only container endpoints, on a network no other service joins.
+
 ## Roadmap
 
 1. **Go core** — checks, scheduler, storage, REST API. ✅
 2. **Dashboard** — React and TypeScript UI, public status page, deployment on AWS with CI/CD. ✅
-3. **Observability** — Prometheus metrics, Grafana dashboards, alerts to Telegram or Discord.
+3. **Observability** — incidents, Telegram alerts, Prometheus metrics, Loki logs and Grafana. ✅
 4. **AI triage** — an agent that uses Claude tool use (`dig`, `curl`, history queries) to explain incidents, plus an MCP server.
 
 Security reports: see [SECURITY.md](SECURITY.md).

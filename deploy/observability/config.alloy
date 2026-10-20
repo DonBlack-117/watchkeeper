@@ -1,0 +1,50 @@
+// Ships the logs of this Compose project's containers to Loki. Docker is
+// reached through socket-proxy, which only allows reading container data.
+
+discovery.docker "containers" {
+  host = "tcp://socket-proxy:2375"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=watchkeeper"]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "tcp://socket-proxy:2375"
+  targets       = discovery.relabel.containers.output
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.app.receiver]
+}
+
+// Watchkeeper logs JSON (log/slog): keep the level as a label for filtering.
+loki.process "app" {
+  stage.match {
+    selector = "{service=\"app\"}"
+
+    stage.json {
+      expressions = { level = "level" }
+    }
+
+    stage.labels {
+      values = { level = "" }
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
