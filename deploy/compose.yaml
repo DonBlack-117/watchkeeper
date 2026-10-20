@@ -1,6 +1,8 @@
 # Production stack for one server: Watchkeeper, PostgreSQL and Caddy (HTTPS).
 # Copy this folder to the server, fill .env from .env.example and run:
 #   docker compose up -d
+# Add Prometheus, Loki, Alloy and Grafana (at grafana.<WK_DOMAIN>) with:
+#   docker compose --profile observability up -d
 name: watchkeeper
 
 services:
@@ -14,6 +16,8 @@ services:
       # Only Caddy, at its fixed address, may set X-Forwarded-For.
       WK_TRUSTED_PROXIES: 172.30.0.2
       WK_COOKIE_SECURE: "true"
+      # Internal only: Prometheus scrapes it over the compose network.
+      WK_METRICS_ADDR: 0.0.0.0:9464
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,9 +51,10 @@ services:
     environment:
       WK_DOMAIN: ${WK_DOMAIN:?set WK_DOMAIN in .env}
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      # Overridable only to try the stack on a laptop without root.
+      - "${WK_HTTP_PORT:-80}:80"
+      - "${WK_HTTPS_PORT:-443}:443"
+      - "${WK_HTTPS_PORT:-443}:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -60,13 +65,127 @@ services:
       internal:
         ipv4_address: 172.30.0.2
 
+  # ---- observability profile ----
+
+  prometheus:
+    image: docker.io/prom/prometheus:v3.15.0
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+    networks: [internal]
+
+  loki:
+    image: docker.io/grafana/loki:3.7.8
+    profiles: [observability]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+    networks: [internal]
+
+  # Alloy reads container logs through this proxy, which exposes only the
+  # read-only container endpoints of the Docker API instead of the socket.
+  socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.5.0
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      # Read-only endpoints Alloy needs: container list, logs and networks.
+      CONTAINERS: 1
+      NETWORKS: 1
+      POST: 0
+    volumes:
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    # SELinux hosts block a container from opening the socket otherwise.
+    security_opt: ["no-new-privileges:true", "label=disable"]
+    mem_limit: 64m
+    # Only Alloy can reach it: the container endpoints also return every
+    # container's environment, secrets included.
+    networks: [logs]
+
+  alloy:
+    image: docker.io/grafana/alloy:v1.21.0
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      ["run", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./observability/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on: [loki, socket-proxy]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    networks: [internal, logs]
+
+  grafana:
+    image: docker.io/grafana/grafana:13.2.4
+    profiles: [observability]
+    restart: unless-stopped
+    # Compose checks ${VAR:?} even for services outside the active profile, so
+    # the required settings are checked here instead: never start Grafana with
+    # its default admin password.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ $${#GF_SECURITY_ADMIN_PASSWORD} -lt 12 ] || [ -z "$$WK_TELEGRAM_BOT_TOKEN" ] || [ -z "$$WK_TELEGRAM_CHAT_ID" ];
+        then echo "set GRAFANA_ADMIN_PASSWORD (12+ characters), WK_TELEGRAM_BOT_TOKEN and WK_TELEGRAM_CHAT_ID in .env" >&2; exit 1; fi;
+        exec /run.sh
+    environment:
+      # Its own subdomain, so Grafana and the dashboard never share an origin.
+      GF_SERVER_ROOT_URL: https://grafana.${WK_DOMAIN}/
+      GF_SECURITY_CONTENT_SECURITY_POLICY: "true"
+      GF_SECURITY_CONTENT_TYPE_PROTECTION: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Read by provisioning/alerting: Grafana alerts when Watchkeeper itself is down.
+      WK_TELEGRAM_BOT_TOKEN: ${WK_TELEGRAM_BOT_TOKEN:-}
+      WK_TELEGRAM_CHAT_ID: ${WK_TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on: [prometheus, loki]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+    networks: [internal]
+
 networks:
+  # Only Alloy and the socket proxy.
+  logs:
+    internal: true
   internal:
     ipam:
       config:
         - subnet: 172.30.0.0/24
+          # Other containers get addresses from the upper half, so Caddy's
+          # fixed 172.30.0.2 is never taken by whichever starts first.
+          ip_range: 172.30.0.128/25
 
 volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  prometheus_data:
+  loki_data:
+  alloy_data:
+  grafana_data:

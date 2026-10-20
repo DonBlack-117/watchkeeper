@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/DonBlack-117/watchkeeper/internal/check"
+	"github.com/DonBlack-117/watchkeeper/internal/notify"
 	"github.com/DonBlack-117/watchkeeper/internal/store"
 )
 
@@ -40,6 +41,20 @@ type Store interface {
 	CreateSession(ctx context.Context, tokenHash []byte, userID int64, expires time.Time) error
 	SessionUser(ctx context.Context, tokenHash []byte, now time.Time) (store.User, error)
 	DeleteSession(ctx context.Context, tokenHash []byte) error
+	ListIncidents(ctx context.Context, q store.IncidentQuery) ([]store.Incident, error)
+	CountOpenIncidents(ctx context.Context) (int, error)
+	ResolveOpen(ctx context.Context, checkID int64, at time.Time) (bool, error)
+}
+
+// HTTPObserver records served requests; *metrics.Metrics implements it.
+type HTTPObserver interface {
+	ObserveHTTP(route, method string, code int, d time.Duration)
+}
+
+// Alerts is the alert channel as seen by the API; *notify.Dispatcher implements it.
+type Alerts interface {
+	Channels() []string
+	SendNow(ctx context.Context, m notify.Message) error
 }
 
 const (
@@ -69,6 +84,10 @@ type Options struct {
 	TrustedProxies []netip.Prefix
 	// Frontend serves every path outside /api/; nil serves nothing there.
 	Frontend http.Handler
+	// Metrics, when set, records every request.
+	Metrics HTTPObserver
+	// Alerts, when set, powers the test-alert endpoint and the summary.
+	Alerts Alerts
 	// AllowPrivate accepts loopback and private targets at validation time.
 	AllowPrivate bool
 	// MaxChecks caps how many checks can exist (default 200).
@@ -90,6 +109,8 @@ type Server struct {
 	status       *statusCache
 	limiter      *rateLimiter
 	loginLimiter *rateLimiter
+	testLimiter  *rateLimiter
+	mux          *http.ServeMux
 }
 
 // New returns a Server.
@@ -114,12 +135,14 @@ func New(store Store, log *slog.Logger, opts Options) *Server {
 		status:       &statusCache{ttl: opts.StatusTTL},
 		limiter:      newRateLimiter(opts.StatusRate, time.Minute),
 		loginLimiter: newRateLimiter(10, time.Minute),
+		testLimiter:  newRateLimiter(5, time.Minute),
 	}
 }
 
 // Handler returns the router wrapped in panic recovery, logging, headers and auth.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.mux = mux
 	mux.HandleFunc("GET /api/v1/health", s.health)
 	mux.HandleFunc("GET /api/v1/status", s.publicStatus)
 	mux.HandleFunc("GET /api/v1/checks", s.listChecks)
@@ -134,6 +157,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/login", s.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
 	mux.HandleFunc("GET /api/v1/auth/me", s.me)
+	mux.HandleFunc("GET /api/v1/incidents", s.listIncidents)
+	mux.HandleFunc("POST /api/v1/alerts/test", s.testAlert)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) { notFound(w, "no such endpoint") })
 	if s.opts.Frontend != nil {
 		mux.Handle("/", s.opts.Frontend)
@@ -392,6 +417,7 @@ func (s *Server) patchCheck(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
+	before := c
 	in.apply(&c)
 	if errs := s.validate(c); len(errs) > 0 {
 		invalid(w, errs)
@@ -405,6 +431,13 @@ func (s *Server) patchCheck(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fail(w, r, "update check", err)
 		return
+	}
+	// A paused check, or one pointed at something else, says nothing more
+	// about its open incident: close it instead of leaving it open forever.
+	if before.Enabled && !updated.Enabled || before.Kind != updated.Kind || before.Target != updated.Target {
+		if _, err := s.store.ResolveOpen(r.Context(), updated.ID, s.now()); err != nil {
+			s.log.ErrorContext(r.Context(), "resolve incident after edit", "check_id", updated.ID, "err", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": view(updated, nil)})
 }
@@ -577,16 +610,27 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 			counts[check.StatusFrom(recent[c.ID])]++
 		}
 	}
+	open, err := s.store.CountOpenIncidents(r.Context())
+	if err != nil {
+		s.fail(w, r, "count incidents", err)
+		return
+	}
+	channels := []string{}
+	if s.opts.Alerts != nil {
+		channels = s.opts.Alerts.Channels()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
-		"checks":      len(checks),
-		"enabled":     enabled,
-		"operational": counts[check.StatusOperational],
-		"degraded":    counts[check.StatusDegraded],
-		"down":        counts[check.StatusDown],
-		"unknown":     counts[check.StatusUnknown],
-		"uptime24h":   sum.Uptime,
-		"p95Ms24h":    sum.P95,
-		"runs24h":     sum.Total,
+		"openIncidents": open,
+		"alertChannels": channels,
+		"checks":        len(checks),
+		"enabled":       enabled,
+		"operational":   counts[check.StatusOperational],
+		"degraded":      counts[check.StatusDegraded],
+		"down":          counts[check.StatusDown],
+		"unknown":       counts[check.StatusUnknown],
+		"uptime24h":     sum.Uptime,
+		"p95Ms24h":      sum.P95,
+		"runs24h":       sum.Total,
 	}})
 }
 
@@ -618,8 +662,12 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		elapsed := time.Since(start)
 		s.log.InfoContext(r.Context(), "http request", "method", r.Method, "path", r.URL.Path,
-			"status", rec.status, "duration_ms", time.Since(start).Milliseconds())
+			"status", rec.status, "duration_ms", elapsed.Milliseconds())
+		if s.opts.Metrics != nil {
+			s.opts.Metrics.ObserveHTTP(s.route(r), methodLabel(r.Method), rec.status, elapsed)
+		}
 	})
 }
 

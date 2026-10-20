@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"html"
 	"net/http"
 
 	"github.com/DonBlack-117/watchkeeper/internal/check"
@@ -65,3 +66,10 @@ func forbidden(w http.ResponseWriter, detail string) {
 func badCredentials(w http.ResponseWriter) {
 	writeProblem(w, Problem{Type: problemBase + "unauthorized", Title: "Unauthorized", Status: http.StatusUnauthorized, Detail: "wrong username or password"})
 }
+
+func badGateway(w http.ResponseWriter, detail string) {
+	writeProblem(w, Problem{Type: problemBase + "bad-gateway", Title: "Bad gateway", Status: http.StatusBadGateway, Detail: detail})
+}
+
+// escHTML escapes text for Telegram's HTML mode.
+func escHTML(s string) string { return html.EscapeString(s) }

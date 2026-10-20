@@ -32,6 +32,9 @@ type Options struct {
 	ReloadInterval time.Duration // how often the check list is re-read (default 30s)
 	// IntervalUnit converts IntervalS into a duration. Tests use time.Millisecond.
 	IntervalUnit time.Duration
+	// OnResult runs after each result is saved, in the check's goroutine:
+	// metrics and incidents hook in here. It must not block for long.
+	OnResult func(ctx context.Context, c check.Check, res check.Result)
 }
 
 // Scheduler keeps one goroutine per enabled check and reloads the list periodically,
@@ -175,6 +178,9 @@ func (s *Scheduler) Healthy() error {
 	return nil
 }
 
+// SaveFailures is the number of results in a row that could not be saved.
+func (s *Scheduler) SaveFailures() int64 { return s.saveFails.Load() }
+
 // forget removes j if it is still the registered job for its check, so the next
 // reload starts a fresh goroutine.
 func (s *Scheduler) forget(j *job) {
@@ -232,12 +238,16 @@ func (s *Scheduler) runOnce(ctx context.Context, c check.Check) {
 	// Saving uses its own deadline so a slow database cannot pile up goroutines.
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if _, err := s.store.SaveResult(saveCtx, res); err != nil {
+	saved, err := s.store.SaveResult(saveCtx, res)
+	if err != nil {
 		fails := s.saveFails.Add(1)
 		s.log.Error("save result", "check_id", c.ID, "name", c.Name, "ok", res.OK, "consecutive_failures", fails, "err", err)
 		return
 	}
 	s.saveFails.Store(0)
+	if s.opts.OnResult != nil {
+		s.opts.OnResult(saveCtx, c, saved)
+	}
 	level := slog.LevelDebug
 	if !res.OK {
 		level = slog.LevelWarn

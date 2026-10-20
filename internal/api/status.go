@@ -76,6 +76,10 @@ func (s *Server) buildStatus(ctx context.Context, now time.Time) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	incidents, err := s.publicIncidents(ctx, now)
+	if err != nil {
+		return nil, err
+	}
 
 	out := []statusCheck{}
 	var statuses []check.Status
@@ -98,6 +102,7 @@ func (s *Server) buildStatus(ctx context.Context, now time.Time) ([]byte, error)
 		"overall":   check.Overall(statuses),
 		"updatedAt": now.UTC(),
 		"checks":    out,
+		"incidents": incidents,
 	}})
 }
 

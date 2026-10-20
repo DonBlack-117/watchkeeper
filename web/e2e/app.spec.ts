@@ -77,12 +77,26 @@ test("public status page needs no login and hides targets", async ({
   await mockApi(page);
   await page.goto("/status");
   await expect(page.getByText("Major outage")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Bitso API" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Bitso API" }).first(),
+  ).toBeVisible();
   await expect(page.getByText("api.bitso.com")).toHaveCount(0);
+  await expect(page.getByText(/ongoing for/)).toBeVisible();
+  await expect(page.getByText("HTTP 503")).toHaveCount(0);
   const overflow = await page.evaluate(
     () =>
       document.documentElement.scrollWidth >
       document.documentElement.clientWidth,
   );
   expect(overflow).toBe(false);
+});
+
+test("sends a test alert from the incidents card", async ({ page }) => {
+  await mockApi(page, { signedIn: true });
+  await page.goto("/");
+  await expect(page.getByText("· timeout").first()).toBeVisible();
+  await page.getByRole("button", { name: "Send test alert" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Test alert sent" }),
+  ).toBeVisible();
 });

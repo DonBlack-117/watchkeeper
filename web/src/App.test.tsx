@@ -60,6 +60,8 @@ const dashboardRoutes: Record<string, Route> = {
     status: 200,
     body: {
       data: {
+        openIncidents: 1,
+        alertChannels: ["telegram"],
         checks: 1,
         enabled: 1,
         operational: 1,
@@ -73,6 +75,24 @@ const dashboardRoutes: Record<string, Route> = {
     },
   }),
   "GET /api/v1/checks/1/latency": () => ({ status: 200, body: { data: [] } }),
+  "GET /api/v1/incidents": () => ({
+    status: 200,
+    body: {
+      data: [
+        {
+          id: 7,
+          checkId: 1,
+          checkName: "Bitso API",
+          status: "down",
+          startedAt: "2026-10-19T10:00:00Z",
+          resolvedAt: null,
+          updates: [
+            { at: "2026-10-19T10:00:00Z", status: "down", error: "timeout" },
+          ],
+        },
+      ],
+    },
+  }),
 };
 
 beforeEach(() => {
@@ -208,6 +228,20 @@ describe("App", () => {
                 daily: days,
               },
             ],
+            incidents: [
+              {
+                id: 3,
+                checkId: 1,
+                name: "Bitso API",
+                status: "degraded",
+                startedAt: "2026-10-18T10:00:00Z",
+                resolvedAt: "2026-10-18T10:25:00Z",
+                updates: [
+                  { at: "2026-10-18T10:00:00Z", status: "degraded" },
+                  { at: "2026-10-18T10:25:00Z", status: "resolved" },
+                ],
+              },
+            ],
           },
         },
       }),
@@ -217,6 +251,7 @@ describe("App", () => {
       await screen.findByText("Some systems are degraded"),
     ).toBeInTheDocument();
     expect(screen.getByText("98.10 % uptime")).toBeInTheDocument();
+    expect(screen.getByText(/lasted 25 min/)).toBeInTheDocument();
     expect(screen.queryByText(/api\.bitso\.com/)).not.toBeInTheDocument();
   });
 
@@ -304,5 +339,25 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "Sign in" }),
     ).toBeInTheDocument();
+  });
+
+  it("lists incidents with their errors and sends a test alert", async () => {
+    const calls = stubFetch({
+      ...dashboardRoutes,
+      "POST /api/v1/alerts/test": () => ({ status: 204 }),
+    });
+    render(<App />);
+    const user = userEvent.setup();
+    const section = (
+      await screen.findByRole("heading", { name: "Incidents" })
+    ).closest("section");
+    if (!section) throw new Error("no incidents section");
+    expect(await within(section).findByText("· timeout")).toBeInTheDocument();
+    expect(within(section).getByText(/ongoing for/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Send test alert" }));
+    expect(
+      await screen.findByText("Test alert sent. Check the Telegram chat."),
+    ).toBeInTheDocument();
+    expect(calls.some((c) => c.key === "POST /api/v1/alerts/test")).toBe(true);
   });
 });

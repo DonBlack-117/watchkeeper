@@ -23,6 +23,30 @@ export function ago(iso: string | null | undefined, now = Date.now()): string {
   return rtf.format(Math.round(s / 86400), "day");
 }
 
+/** "2 h 5 min", "6 min" or "40 s" between two ISO times (or until now). */
+export function duration(
+  fromIso: string,
+  toIso?: string | null,
+  now = Date.now(),
+): string {
+  const end = toIso ? new Date(toIso).getTime() : now;
+  const s = Math.max(0, Math.round((end - new Date(fromIso).getTime()) / 1000));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min`;
+  if (s < 172800)
+    return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+  return `${Math.floor(s / 86400)} days ${Math.floor((s % 86400) / 3600)} h`;
+}
+
+export function dateTime(iso: string): string {
+  return new Date(iso).toLocaleString("en-GB", {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export function hourLabel(iso: string): string {
   return new Date(iso).toLocaleTimeString("en-GB", {
     hour: "2-digit",

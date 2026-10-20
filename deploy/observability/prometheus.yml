@@ -1,0 +1,16 @@
+# Scrapes Watchkeeper's internal metrics listener every 15 s. Retention is set
+# with --storage.tsdb.retention.time in compose.yaml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: watchkeeper
+    static_configs:
+      - targets: ["app:9464"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]

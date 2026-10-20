@@ -42,6 +42,10 @@ Errors are returned as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) proble
 
 `429`. One client made more than 60 requests per minute to `/api/v1/status`, or more than 10 login attempts per minute. Retry after the time in `Retry-After`.
 
+## bad-gateway
+
+`502`. `POST /api/v1/alerts/test` could not deliver the message. The detail has Telegram's answer; `401 Unauthorized` means a wrong bot token and `400 Bad Request: chat not found` a wrong chat id or a bot that was never added to the chat.
+
 ## internal
 
 `500`. Something failed on the server. Details are written to the log, never to the response.

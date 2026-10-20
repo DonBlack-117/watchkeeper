@@ -55,6 +55,9 @@ export type CheckPatch = Omit<CheckInput, "expectedStatus"> & {
 };
 
 export interface Summary {
+  openIncidents: number;
+  /** Configured alert channels, for example ["telegram"]. */
+  alertChannels: string[];
   checks: number;
   enabled: number;
   operational: number;
@@ -84,10 +87,40 @@ export interface PublicCheck {
   daily: (number | null)[];
 }
 
+export type IncidentStatus = "degraded" | "down";
+
+export interface IncidentUpdate {
+  at: string;
+  status: IncidentStatus | "resolved";
+  /** Error category of the run; only the dashboard gets it. */
+  error?: string;
+}
+
+export interface Incident {
+  id: number;
+  checkId: number;
+  checkName: string;
+  status: IncidentStatus;
+  startedAt: string;
+  resolvedAt: string | null;
+  updates: IncidentUpdate[];
+}
+
+export interface PublicIncident {
+  id: number;
+  checkId: number;
+  name: string;
+  status: IncidentStatus;
+  startedAt: string;
+  resolvedAt: string | null;
+  updates: Omit<IncidentUpdate, "error">[];
+}
+
 export interface PublicStatus {
   overall: Exclude<Status, "unknown">;
   updatedAt: string;
   checks: PublicCheck[];
+  incidents: PublicIncident[];
 }
 
 export interface Me {

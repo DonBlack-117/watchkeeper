@@ -19,7 +19,7 @@ After the first successful `Deploy` run, open the package at `github.com/DonBlac
 
 In the EC2 console (region of your choice):
 
-1. **Launch instance** with Amazon Linux 2023. `t4g.small` (ARM, 2 GiB) or `t3.micro` (x86, 1 GiB) are enough; the image is built for both.
+1. **Launch instance** with Amazon Linux 2023. `t4g.small` (ARM, 2 GiB) is enough for everything, including the observability profile; `t3.micro` (x86, 1 GiB) only runs the base stack. The image is built for both.
 2. Key pair: create one (`ed25519`) and keep the `.pem` file.
 3. Security group: allow **HTTP 80** and **HTTPS 443** from anywhere, and **SSH 22**. GitHub-hosted runners have no fixed addresses, so automatic deploys need port 22 open to anywhere; that is acceptable only because password logins are off (the Amazon Linux default) and the deploy key can run nothing but the roll-out script (step 4). If you prefer manual deploys, keep 22 limited to your IP and skip step 4.
 4. Storage: 20 GiB gp3.
@@ -71,6 +71,27 @@ In the environment, set **Deployment branches** to `main` only; you can also add
 
 From then on each push to `main` builds, tests, publishes `ghcr.io/donblack-117/watchkeeper:sha-<commit>`, updates `WK_IMAGE` in the server's `.env`, restarts the app and waits for `/api/v1/health`.
 
+## 5. Telegram alerts
+
+1. In Telegram, talk to **@BotFather**, send `/newbot` and keep the token it gives you (`123456789:AA…`).
+2. Send any message to your new bot (or add it to a group), then open `https://api.telegram.org/bot<token>/getUpdates` and copy `message.chat.id`. Group ids are negative.
+3. On the server, set `WK_TELEGRAM_BOT_TOKEN`, `WK_TELEGRAM_CHAT_ID` and, for links in the messages, `WK_PUBLIC_URL=https://<WK_DOMAIN>` in `.env`, then run `docker compose up -d app`.
+4. In the dashboard, press **Send test alert** in the Incidents card. A wrong token or chat id shows Telegram's error right there.
+
+Watchkeeper alerts when a check goes down, when it recovers (only if the outage was announced) and 30 and 14 days before a certificate expires. Set `WK_ALERT_ON_DEGRADED=true` to also hear about slow or flapping checks.
+
+## 6. Observability (optional)
+
+Prometheus, Loki, Alloy and Grafana run in the `observability` Compose profile. Set `GRAFANA_ADMIN_PASSWORD` (12 or more characters) and the Telegram variables in `.env`, then:
+
+```bash
+docker compose --profile observability up -d
+```
+
+Open `https://grafana.<WK_DOMAIN>` (for example `grafana.3-91-10-20.sslip.io`; sslip.io resolves subdomains too) and sign in with `GRAFANA_ADMIN_USER`. Grafana has its own subdomain so it never shares an origin, or a session cookie, with the dashboard. The **Watchkeeper** folder has the dashboard and two alert rules (Watchkeeper unreachable, results not saved) that notify the same Telegram chat. Nothing in the profile is published: Prometheus and Loki are only reachable on the internal network and Grafana through Caddy. Alloy reads container logs through a socket proxy limited to read-only endpoints; those endpoints still return every container's environment, so the proxy sits on a network only Alloy can reach. Prometheus keeps 15 days of metrics and Loki 14 days of logs.
+
+To stop it: `docker compose --profile observability stop prometheus loki alloy socket-proxy grafana`.
+
 ## Operations
 
 ```bash
@@ -82,4 +103,4 @@ docker compose exec -T postgres pg_dump -U watchkeeper watchkeeper | gzip > watc
 sed -i 's#^WK_IMAGE=.*#WK_IMAGE=ghcr.io/donblack-117/watchkeeper:sha-<old>#' .env && docker compose up -d app
 ```
 
-Cost: a `t4g.small` or `t3.micro` with 20 GiB of gp3 and an Elastic IP in use stays around 8 to 15 USD a month after the free tier credits.
+Cost: a `t4g.small` with 20 GiB of gp3 and a public IPv4 address stays around 17 USD a month (a `t3.micro` without the observability profile, around 13 USD), covered by the credits of a new account's free plan.

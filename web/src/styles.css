@@ -854,3 +854,88 @@ dialog::backdrop {
     animation: none !important;
   }
 }
+
+/* ---- incidents ---- */
+
+.incidents {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.incident {
+  display: grid;
+  gap: 6px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.incident:first-child {
+  border-top: 0;
+}
+
+.incident-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.incident-head h3 {
+  font-size: 14px;
+}
+
+.incident-meta {
+  margin: 0;
+  font-size: 12px;
+}
+
+.timeline {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.timeline li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot-degraded {
+  background: var(--degraded);
+}
+
+.dot-down {
+  background: var(--down);
+}
+
+.dot-resolved {
+  background: var(--ok);
+}
+
+.incident-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 18px;
+  color: var(--text-muted);
+}
+
+.incident-empty svg {
+  color: var(--ok);
+}
