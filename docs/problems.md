@@ -8,7 +8,11 @@ Errors are returned as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) proble
 
 ## unauthorized
 
-`401`. `WK_API_TOKEN` is set and the request has no valid `Authorization: Bearer <token>` header. `/api/v1/status` and `/api/v1/health` never require it.
+`401`. Authentication is on (`WK_API_TOKEN` or `WK_ADMIN_USER` is set) and the request has neither a valid `Authorization: Bearer <token>` header nor a dashboard session. A failed login also returns it, with the detail `wrong username or password`. `/api/v1/status`, `/api/v1/health` and the login endpoints never require it.
+
+## forbidden
+
+`403`. A request that changes data with a session cookie came without an `Origin` header that matches the host. Browsers send it on every `POST`, `PATCH` and `DELETE`, so this blocks cross-site request forgery. Scripts should use the bearer token instead of the cookie.
 
 ## not-found
 
@@ -36,7 +40,7 @@ Errors are returned as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) proble
 
 ## rate-limited
 
-`429`. One client made more than 60 requests per minute to `/api/v1/status`. Retry after the time in `Retry-After`.
+`429`. One client made more than 60 requests per minute to `/api/v1/status`, or more than 10 login attempts per minute. Retry after the time in `Retry-After`.
 
 ## internal
 

@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,24 +18,30 @@ const DefaultDatabaseURL = "postgres://watchkeeper:watchkeeper@localhost:5432/wa
 
 // Config holds every setting; Load fills it from WK_* variables.
 type Config struct {
-	Addr           string        // WK_ADDR
-	DatabaseURL    string        // WK_DATABASE_URL
-	APIToken       string        // WK_API_TOKEN: required when Addr is not loopback
-	AllowPrivate   bool          // WK_ALLOW_PRIVATE_TARGETS: let checks reach localhost and private networks
-	MaxConcurrent  int           // WK_MAX_CONCURRENT
-	MaxChecks      int           // WK_MAX_CHECKS
-	ReloadInterval time.Duration // WK_RELOAD_INTERVAL
-	RetentionDays  int           // WK_RETENTION_DAYS
-	LogLevel       slog.Level    // WK_LOG_LEVEL: debug, info, warn, error
+	Addr           string         // WK_ADDR
+	DatabaseURL    string         // WK_DATABASE_URL
+	APIToken       string         // WK_API_TOKEN: required when Addr is not loopback
+	AllowPrivate   bool           // WK_ALLOW_PRIVATE_TARGETS: let checks reach localhost and private networks
+	MaxConcurrent  int            // WK_MAX_CONCURRENT
+	MaxChecks      int            // WK_MAX_CHECKS
+	ReloadInterval time.Duration  // WK_RELOAD_INTERVAL
+	RetentionDays  int            // WK_RETENTION_DAYS
+	LogLevel       slog.Level     // WK_LOG_LEVEL: debug, info, warn, error
+	AdminUser      string         // WK_ADMIN_USER: dashboard account created or updated at startup
+	AdminPassword  string         // WK_ADMIN_PASSWORD
+	SecureCookie   bool           // WK_COOKIE_SECURE: default true unless Addr is loopback
+	TrustedProxies []netip.Prefix // WK_TRUSTED_PROXIES: comma-separated CIDRs or IPs
 }
 
 // Load reads the environment. It listens on localhost by default and refuses to
-// listen elsewhere without an API token.
+// listen elsewhere without an API token or a dashboard account.
 func Load() (Config, error) {
 	c := Config{
 		Addr:           env("WK_ADDR", "127.0.0.1:8090"),
 		DatabaseURL:    env("WK_DATABASE_URL", DefaultDatabaseURL),
 		APIToken:       os.Getenv("WK_API_TOKEN"),
+		AdminUser:      os.Getenv("WK_ADMIN_USER"),
+		AdminPassword:  os.Getenv("WK_ADMIN_PASSWORD"),
 		ReloadInterval: 30 * time.Second,
 	}
 	var errs []error
@@ -64,8 +71,25 @@ func Load() (Config, error) {
 	if c.APIToken != "" && len(c.APIToken) < 32 {
 		errs = append(errs, errors.New("WK_API_TOKEN must be at least 32 characters (try: openssl rand -hex 32)"))
 	}
-	if !IsLoopback(c.Addr) && c.APIToken == "" {
-		errs = append(errs, fmt.Errorf("WK_ADDR %q is not a loopback address: set WK_API_TOKEN before exposing the API", c.Addr))
+	if (c.AdminUser == "") != (c.AdminPassword == "") {
+		errs = append(errs, errors.New("set both WK_ADMIN_USER and WK_ADMIN_PASSWORD, or neither"))
+	}
+	if c.AdminPassword != "" && (len(c.AdminPassword) < 12 || len(c.AdminPassword) > 72) {
+		errs = append(errs, errors.New("WK_ADMIN_PASSWORD must be between 12 and 72 bytes"))
+	}
+	if len(c.AdminUser) > 64 {
+		errs = append(errs, errors.New("WK_ADMIN_USER must be at most 64 characters"))
+	}
+	if !IsLoopback(c.Addr) && c.APIToken == "" && c.AdminUser == "" {
+		errs = append(errs, fmt.Errorf("WK_ADDR %q is not a loopback address: set WK_API_TOKEN or WK_ADMIN_USER before exposing the API", c.Addr))
+	}
+	if c.SecureCookie, err = boolEnv("WK_COOKIE_SECURE", !IsLoopback(c.Addr)); err != nil {
+		errs = append(errs, err)
+	} else if !c.SecureCookie && !IsLoopback(c.Addr) {
+		errs = append(errs, errors.New("WK_COOKIE_SECURE=false is only allowed on a loopback WK_ADDR; serve the dashboard over HTTPS"))
+	}
+	if c.TrustedProxies, err = prefixes(os.Getenv("WK_TRUSTED_PROXIES")); err != nil {
+		errs = append(errs, err)
 	}
 	return c, errors.Join(errs...)
 }
@@ -112,4 +136,29 @@ func boolEnv(key string, def bool) (bool, error) {
 		return def, fmt.Errorf("%s must be true or false, got %q", key, v)
 	}
 	return b, nil
+}
+
+// prefixes parses a comma-separated list of CIDRs; a bare IP becomes a single-address prefix.
+func prefixes(v string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(v, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if !strings.Contains(f, "/") {
+			a, err := netip.ParseAddr(f)
+			if err != nil {
+				return nil, fmt.Errorf("WK_TRUSTED_PROXIES: %q is not an IP or CIDR", f)
+			}
+			out = append(out, netip.PrefixFrom(a.Unmap(), a.Unmap().BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			return nil, fmt.Errorf("WK_TRUSTED_PROXIES: %q is not an IP or CIDR", f)
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }

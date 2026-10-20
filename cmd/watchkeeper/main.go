@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/DonBlack-117/watchkeeper/internal/config"
 	"github.com/DonBlack-117/watchkeeper/internal/scheduler"
 	"github.com/DonBlack-117/watchkeeper/internal/store"
+	"github.com/DonBlack-117/watchkeeper/internal/ui"
 )
 
 const (
@@ -27,6 +30,11 @@ const (
 )
 
 func main() {
+	// The distroless image has no shell or curl, so the container health check
+	// runs the binary itself: watchkeeper healthcheck.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck())
+	}
 	if err := run(); err != nil {
 		slog.Error("watchkeeper stopped", "err", err)
 		os.Exit(1)
@@ -55,16 +63,26 @@ func run() error {
 		return err
 	}
 	defer st.Close()
+	if cfg.AdminUser != "" {
+		if err := ensureAdmin(ctx, st, cfg.AdminUser, cfg.AdminPassword); err != nil {
+			return err
+		}
+		log.Info("dashboard account ready", "user", cfg.AdminUser)
+	}
 
 	sched := scheduler.New(st, check.NewRunner(cfg.AllowPrivate), log, scheduler.Options{
 		MaxConcurrent:  cfg.MaxConcurrent,
 		ReloadInterval: cfg.ReloadInterval,
 	})
 	handler := api.New(st, log, api.Options{
-		Token:        cfg.APIToken,
-		AllowPrivate: cfg.AllowPrivate,
-		MaxChecks:    cfg.MaxChecks,
-		Health:       sched.Healthy,
+		Token:          cfg.APIToken,
+		AllowPrivate:   cfg.AllowPrivate,
+		MaxChecks:      cfg.MaxChecks,
+		Health:         sched.Healthy,
+		RequireLogin:   cfg.AdminUser != "",
+		SecureCookie:   cfg.SecureCookie,
+		TrustedProxies: cfg.TrustedProxies,
+		Frontend:       ui.Handler(),
 	}).Handler()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -84,7 +102,7 @@ func run() error {
 	}()
 	go prune(ctx, st, cfg.RetentionDays, log)
 	go func() {
-		log.Info("listening", "addr", cfg.Addr, "auth", cfg.APIToken != "", "retention_days", cfg.RetentionDays)
+		log.Info("listening", "addr", cfg.Addr, "token", cfg.APIToken != "", "login", cfg.AdminUser != "", "retention_days", cfg.RetentionDays)
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errc <- fmt.Errorf("http server: %w", err)
 		}
@@ -126,7 +144,54 @@ func connect(ctx context.Context, url string, log *slog.Logger) (*store.Store, e
 	return st, nil
 }
 
-// prune deletes results older than the retention period once an hour.
+// ensureAdmin creates the dashboard account or updates its password. An
+// unchanged password is left alone: bcrypt salts differ on every hash, so
+// rewriting it would sign everyone out on each restart.
+func ensureAdmin(ctx context.Context, st *store.Store, user, password string) error {
+	if u, err := st.UserByName(ctx, user); err == nil && api.PasswordMatches(u.PasswordHash, password) {
+		return nil
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("admin account: %w", err)
+	}
+	hash, err := api.HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("admin password: %w", err)
+	}
+	if _, err := st.EnsureUser(ctx, user, hash); err != nil {
+		return fmt.Errorf("admin account: %w", err)
+	}
+	return nil
+}
+
+// healthcheck asks the running server for /api/v1/health on its own port.
+func healthcheck() int {
+	port := 8090
+	if _, p, err := net.SplitHostPort(os.Getenv("WK_ADDR")); err == nil {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
+			port = n
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/api/v1/health"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // loopback only; the port is a validated integer
+	if err != nil {
+		return 1
+	}
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // same loopback request as above
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "health:", resp.Status)
+		return 1
+	}
+	return 0
+}
+
+// prune deletes results older than the retention period and expired sessions once an hour.
 func prune(ctx context.Context, st *store.Store, days int, log *slog.Logger) {
 	ticker := time.NewTicker(pruneEvery)
 	defer ticker.Stop()
@@ -138,6 +203,11 @@ func prune(ctx context.Context, st *store.Store, days int, log *slog.Logger) {
 			log.Error("prune old results", "cutoff", cutoff, "deleted", n, "err", err)
 		case n > 0:
 			log.Info("pruned old results", "cutoff", cutoff, "deleted", n)
+		}
+		if n, err := st.PruneSessions(ctx, time.Now()); err != nil && ctx.Err() == nil {
+			log.Error("prune expired sessions", "err", err)
+		} else if n > 0 {
+			log.Info("pruned expired sessions", "deleted", n)
 		}
 		select {
 		case <-ctx.Done():

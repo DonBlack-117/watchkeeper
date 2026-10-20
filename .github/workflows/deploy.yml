@@ -1,0 +1,99 @@
+name: Deploy
+
+# Runs after CI passes on main: publishes the image to GHCR and, when the
+# server is configured, rolls it out over SSH.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  image:
+    # Manual runs only from main, so an untested branch never becomes :latest.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: name
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "image=$repo:sha-${SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}
+            ${{ steps.name.outputs.repo }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha || github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    # Skipped until the server is set up (see docs/deploy.md).
+    if: vars.DEPLOY_HOST != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.DEPLOY_DOMAIN }}
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Roll out
+        env:
+          HOST: ${{ vars.DEPLOY_HOST }}
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          # The key only runs deploy/roll.sh on the server (forced command),
+          # which validates the tag; see docs/deploy.md.
+          ssh "deploy@$HOST" "$IMAGE"
+      - name: Smoke test
+        env:
+          DOMAIN: ${{ vars.DEPLOY_DOMAIN }}
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS "https://$DOMAIN/api/v1/health"; then exit 0; fi
+            sleep 6
+          done
+          echo "health check did not pass after 2 minutes" >&2
+          exit 1

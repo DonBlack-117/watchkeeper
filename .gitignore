@@ -10,3 +10,6 @@
 .vscode/
 .claude/
 CLAUDE.md
+
+# Frontend build, embedded by internal/ui (npm run build in web/)
+/internal/ui/dist/app/

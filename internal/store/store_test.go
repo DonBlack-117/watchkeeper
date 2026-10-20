@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -164,4 +165,121 @@ func TestStore(t *testing.T) {
 			t.Fatalf("results should be gone, got %d", len(res))
 		}
 	})
+}
+
+func TestStatsAndLatency(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 19, 12, 30, 0, 0, time.UTC)
+	a, err := s.CreateCheck(ctx, sample("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := sample("off")
+	off.Enabled = false
+	b, err := s.CreateCheck(ctx, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(id int64, at time.Time, ok bool, ms int) {
+		t.Helper()
+		if _, err := s.SaveResult(ctx, check.Result{CheckID: id, StartedAt: at, OK: ok, TotalMS: ms}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Current hour: 100..1000 ms in steps of 100, plus a slow failure that must not count.
+	for i := 1; i <= 10; i++ {
+		save(a.ID, now.Add(-time.Duration(i)*time.Minute), true, i*100)
+	}
+	save(a.ID, now.Add(-15*time.Minute), false, 30000)
+	save(a.ID, now.Add(-3*time.Hour), true, 50)
+	save(a.ID, now.AddDate(0, 0, -2), false, 10)
+	save(b.ID, now.Add(-time.Minute), false, 10)
+
+	to := now.Truncate(time.Hour).Add(time.Hour)
+	hours, err := s.HourlyLatency(ctx, a.ID, to.Add(-24*time.Hour), to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hours) != 24 {
+		t.Fatalf("hours = %d", len(hours))
+	}
+	last := hours[23]
+	if !last.Hour.Equal(now.Truncate(time.Hour)) || last.Total != 11 || last.OK != 10 || math.Abs(*last.P50-550) > 0.01 || math.Abs(*last.P95-955) > 0.01 {
+		t.Fatalf("current hour: %+v p50=%v p95=%v", last, *last.P50, *last.P95)
+	}
+	if hours[20].P50 == nil || *hours[20].P50 != 50 || hours[0].P50 != nil {
+		t.Errorf("older hours: %+v / %+v", hours[20], hours[0])
+	}
+
+	stats, err := s.StatsSince(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := stats[a.ID]; st.P95 == nil || st.Uptime < 91 || st.Uptime > 92 {
+		t.Errorf("stats a: %+v", st) // 11 of 12 runs passed
+	}
+
+	sum, err := s.SummarySince(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Total != 12 || sum.OK != 11 {
+		t.Errorf("summary must skip the disabled check: %+v", sum)
+	}
+
+	daily, err := s.DailyUptimeAll(ctx, 90, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	da := daily[a.ID]
+	if len(da) != 90 || da[89].Day != "2026-10-19" || da[89].Total != 12 || da[87].Percent == nil || *da[87].Percent != 0 || da[88].Percent != nil {
+		t.Fatalf("daily a: %+v %+v %+v", da[87], da[88], da[89])
+	}
+}
+
+func TestUsersAndSessions(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	u, err := s.EnsureUser(ctx, "diego", "hash-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.EnsureUser(ctx, "diego", "hash-2")
+	if err != nil || again.ID != u.ID || again.PasswordHash != "hash-2" {
+		t.Fatalf("ensure twice: %+v %v", again, err)
+	}
+	if _, err := s.UserByName(ctx, "ghost"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing user: %v", err)
+	}
+	live, expired := make([]byte, 32), make([]byte, 32)
+	live[0], expired[0] = 1, 2
+	if err := s.CreateSession(ctx, live, u.ID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(ctx, expired, u.ID, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.SessionUser(ctx, live, now); err != nil || got.Username != "diego" {
+		t.Fatalf("live session: %+v %v", got, err)
+	}
+	if _, err := s.SessionUser(ctx, expired, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired session: %v", err)
+	}
+	if n, err := s.PruneSessions(ctx, now); err != nil || n != 1 {
+		t.Fatalf("prune: %d %v", n, err)
+	}
+	if _, err := s.EnsureUser(ctx, "diego", "hash-3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SessionUser(ctx, live, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a password change must end existing sessions: %v", err)
+	}
+	if err := s.DeleteSession(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SessionUser(ctx, live, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted session: %v", err)
+	}
 }

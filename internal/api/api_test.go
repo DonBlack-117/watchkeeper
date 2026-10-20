@@ -19,15 +19,25 @@ import (
 
 // memStore is an in-memory Store for handler tests.
 type memStore struct {
-	mu      sync.Mutex
-	nextID  int64
-	checks  map[int64]check.Check
-	results map[int64][]check.Result // newest first
-	pingErr error
+	mu       sync.Mutex
+	nextID   int64
+	checks   map[int64]check.Check
+	results  map[int64][]check.Result // newest first
+	users    map[string]store.User
+	sessions map[string]memSession
+	pingErr  error
+
+	sessionLookups int
+}
+
+type memSession struct {
+	userID  int64
+	expires time.Time
 }
 
 func newMem() *memStore {
-	return &memStore{checks: map[int64]check.Check{}, results: map[int64][]check.Result{}}
+	return &memStore{checks: map[int64]check.Check{}, results: map[int64][]check.Result{},
+		users: map[string]store.User{}, sessions: map[string]memSession{}}
 }
 
 func (m *memStore) Ping(context.Context) error { return m.pingErr }
@@ -125,6 +135,70 @@ func (m *memStore) DailyUptime(_ context.Context, _ int64, days int, now time.Ti
 
 func (m *memStore) UptimeSince(context.Context, time.Time) (map[int64]float64, error) {
 	return map[int64]float64{1: 99.5}, nil
+}
+
+func (m *memStore) StatsSince(context.Context, time.Time) (map[int64]store.CheckStats, error) {
+	p95 := 180.0
+	return map[int64]store.CheckStats{1: {Uptime: 98, P95: &p95}}, nil
+}
+
+func (m *memStore) SummarySince(context.Context, time.Time) (store.Summary, error) {
+	u, p95 := 99.0, 200.0
+	return store.Summary{Total: 100, OK: 99, Uptime: &u, P95: &p95}, nil
+}
+
+func (m *memStore) DailyUptimeAll(_ context.Context, days int, now time.Time) (map[int64][]store.DayUptime, error) {
+	series, _ := m.DailyUptime(context.Background(), 1, days, now)
+	p := 100.0
+	series[days-1].Percent = &p
+	return map[int64][]store.DayUptime{1: series}, nil
+}
+
+func (m *memStore) HourlyLatency(_ context.Context, _ int64, from, to time.Time) ([]store.HourLatency, error) {
+	out := []store.HourLatency{}
+	for h := from; h.Before(to); h = h.Add(time.Hour) {
+		out = append(out, store.HourLatency{Hour: h})
+	}
+	return out, nil
+}
+
+func (m *memStore) UserByName(_ context.Context, name string) (store.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u, ok := m.users[name]; ok {
+		return u, nil
+	}
+	return store.User{}, store.ErrNotFound
+}
+
+func (m *memStore) CreateSession(_ context.Context, hash []byte, userID int64, expires time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[string(hash)] = memSession{userID, expires}
+	return nil
+}
+
+func (m *memStore) SessionUser(_ context.Context, hash []byte, now time.Time) (store.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionLookups++
+	sess, ok := m.sessions[string(hash)]
+	if !ok || !sess.expires.After(now) {
+		return store.User{}, store.ErrNotFound
+	}
+	for _, u := range m.users {
+		if u.ID == sess.userID {
+			return u, nil
+		}
+	}
+	return store.User{}, store.ErrNotFound
+}
+
+func (m *memStore) DeleteSession(_ context.Context, hash []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, string(hash))
+	return nil
 }
 
 func newServer(m *memStore) http.Handler { return newServerWith(m, Options{}) }
@@ -367,5 +441,70 @@ func TestHealthReportsScheduler(t *testing.T) {
 	rec, body := do(t, h, "GET", "/api/v1/health", "")
 	if rec.Code != http.StatusServiceUnavailable || body["scheduler"] != "check list not reloaded recently" {
 		t.Fatalf("health = %d %v", rec.Code, body)
+	}
+}
+
+func TestLatencyWindow(t *testing.T) {
+	h := newServer(newMem())
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	_, body := do(t, h, "GET", "/api/v1/checks/1/latency", "")
+	hours := body["data"].([]any)
+	if len(hours) != 24 {
+		t.Fatalf("default window: %d hours", len(hours))
+	}
+	if last := hours[23].(map[string]any)["hour"]; last != "2026-10-19T12:00:00Z" {
+		t.Errorf("the window must end with the current hour, got %v", last)
+	}
+	for _, w := range []string{"30m", "90m", "200h", "x"} {
+		if rec, _ := do(t, h, "GET", "/api/v1/checks/1/latency?window="+w, ""); rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("window=%s: status = %d", w, rec.Code)
+		}
+	}
+}
+
+func TestListAndSummaryStats(t *testing.T) {
+	m := newMem()
+	h := newServer(m)
+	do(t, h, "POST", "/api/v1/checks", validBody)
+	do(t, h, "POST", "/api/v1/checks", `{"name":"dns","kind":"dns","target":"donblack.dev"}`)
+	m.results[1] = []check.Result{{ID: 1, CheckID: 1, OK: false}}
+
+	_, body := do(t, h, "GET", "/api/v1/checks", "")
+	first := body["data"].([]any)[0].(map[string]any)
+	if first["uptime24h"].(float64) != 98 || first["p95Ms24h"].(float64) != 180 || len(first["daily"].([]any)) != 90 {
+		t.Fatalf("list stats: %v", first)
+	}
+	second := body["data"].([]any)[1].(map[string]any)
+	if _, ok := second["uptime24h"]; ok || len(second["daily"].([]any)) != 90 {
+		t.Errorf("a check without runs has no stats but a full empty series: %v", second)
+	}
+
+	_, body = do(t, h, "GET", "/api/v1/summary", "")
+	sum := body["data"].(map[string]any)
+	if sum["checks"].(float64) != 2 || sum["down"].(float64) != 1 || sum["unknown"].(float64) != 1 || sum["uptime24h"].(float64) != 99 {
+		t.Fatalf("summary: %v", sum)
+	}
+
+	_, body = do(t, h, "GET", "/api/v1/status", "")
+	daily := body["data"].(map[string]any)["checks"].([]any)[0].(map[string]any)["daily"].([]any)
+	if len(daily) != 90 || daily[89].(float64) != 100 {
+		t.Errorf("status daily bars: %v", daily[85:])
+	}
+}
+
+func TestPatchClearsExpectedStatus(t *testing.T) {
+	h := newServer(newMem())
+	do(t, h, "POST", "/api/v1/checks", `{"name":"a","kind":"http","target":"https://example.com","expectedStatus":204}`)
+
+	_, body := do(t, h, "PATCH", "/api/v1/checks/1", `{"name":"renamed"}`)
+	if body["data"].(map[string]any)["expectedStatus"].(float64) != 204 {
+		t.Fatalf("a missing field must keep the value: %v", body)
+	}
+	rec, body := do(t, h, "PATCH", "/api/v1/checks/1", `{"kind":"dns","target":"example.com","expectedStatus":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("switch to dns with null expectedStatus: %d %v", rec.Code, body)
+	}
+	if _, ok := body["data"].(map[string]any)["expectedStatus"]; ok {
+		t.Fatalf("null must clear expectedStatus: %v", body)
 	}
 }
