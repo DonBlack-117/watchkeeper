@@ -1,0 +1,72 @@
+# Production stack for one server: Watchkeeper, PostgreSQL and Caddy (HTTPS).
+# Copy this folder to the server, fill .env from .env.example and run:
+#   docker compose up -d
+name: watchkeeper
+
+services:
+  app:
+    image: ${WK_IMAGE:?set WK_IMAGE in .env}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WK_ADDR: 0.0.0.0:8090
+      WK_DATABASE_URL: postgres://watchkeeper:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/watchkeeper?sslmode=disable
+      # Only Caddy, at its fixed address, may set X-Forwarded-For.
+      WK_TRUSTED_PROXIES: 172.30.0.2
+      WK_COOKIE_SECURE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The binary writes nothing to disk and needs no capabilities.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 256
+    networks: [internal]
+
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: watchkeeper
+      POSTGRES_USER: watchkeeper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watchkeeper -d watchkeeper"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+
+  caddy:
+    image: docker.io/library/caddy:2.11-alpine
+    restart: unless-stopped
+    environment:
+      WK_DOMAIN: ${WK_DOMAIN:?set WK_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [app]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      internal:
+        ipv4_address: 172.30.0.2
+
+networks:
+  internal:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

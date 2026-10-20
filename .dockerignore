@@ -1,0 +1,11 @@
+.git
+.github
+.env
+*.out
+/watchkeeper
+internal/ui/dist/app
+web/node_modules
+web/test-results
+web/playwright-report
+deploy
+docs

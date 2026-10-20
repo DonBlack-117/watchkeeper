@@ -1,4 +1,4 @@
-.PHONY: db run test test-short lint seed tidy
+.PHONY: db run test test-short lint seed tidy web web-dev web-test build image
 
 # Testcontainers with rootless Podman: use its socket when Docker is not there.
 PODMAN_SOCK := /run/user/$(shell id -u)/podman/podman.sock
@@ -31,3 +31,20 @@ seed:
 
 tidy:
 	go mod tidy
+
+# Frontend: build it once so `make run` serves the dashboard on :8090,
+# or run `make web-dev` for Vite with hot reload on :5173 (proxies /api).
+web:
+	cd web && npm ci --no-audit --no-fund && npm run build
+
+web-dev:
+	cd web && npm run dev
+
+web-test:
+	cd web && npm run lint && npm run typecheck && npm test && npm run test:e2e
+
+build: web
+	CGO_ENABLED=0 go build -trimpath -o watchkeeper ./cmd/watchkeeper
+
+image:
+	podman build --format docker -t watchkeeper:dev . || docker build -t watchkeeper:dev .

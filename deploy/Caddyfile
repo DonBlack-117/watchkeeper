@@ -1,0 +1,7 @@
+# Caddy gets and renews the Let's Encrypt certificate for WK_DOMAIN by itself.
+# It replaces any X-Forwarded-For sent by the client with the real address.
+{$WK_DOMAIN} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy app:8090
+}

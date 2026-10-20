@@ -57,3 +57,11 @@ func conflict(w http.ResponseWriter, detail string) {
 func tooManyRequests(w http.ResponseWriter) {
 	writeProblem(w, Problem{Type: problemBase + "rate-limited", Title: "Too many requests", Status: http.StatusTooManyRequests})
 }
+
+func forbidden(w http.ResponseWriter, detail string) {
+	writeProblem(w, Problem{Type: problemBase + "forbidden", Title: "Forbidden", Status: http.StatusForbidden, Detail: detail})
+}
+
+func badCredentials(w http.ResponseWriter) {
+	writeProblem(w, Problem{Type: problemBase + "unauthorized", Title: "Unauthorized", Status: http.StatusUnauthorized, Detail: "wrong username or password"})
+}

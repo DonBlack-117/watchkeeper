@@ -3,13 +3,13 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -32,6 +32,14 @@ type Store interface {
 	RecentResults(ctx context.Context, n int) (map[int64][]check.Result, error)
 	DailyUptime(ctx context.Context, checkID int64, days int, now time.Time) ([]store.DayUptime, error)
 	UptimeSince(ctx context.Context, since time.Time) (map[int64]float64, error)
+	StatsSince(ctx context.Context, since time.Time) (map[int64]store.CheckStats, error)
+	SummarySince(ctx context.Context, since time.Time) (store.Summary, error)
+	DailyUptimeAll(ctx context.Context, days int, now time.Time) (map[int64][]store.DayUptime, error)
+	HourlyLatency(ctx context.Context, checkID int64, from, to time.Time) ([]store.HourLatency, error)
+	UserByName(ctx context.Context, username string) (store.User, error)
+	CreateSession(ctx context.Context, tokenHash []byte, userID int64, expires time.Time) error
+	SessionUser(ctx context.Context, tokenHash []byte, now time.Time) (store.User, error)
+	DeleteSession(ctx context.Context, tokenHash []byte) error
 }
 
 const (
@@ -40,13 +48,27 @@ const (
 	maxLimit       = 500
 	maxUptimeDays  = 90
 	statusLookback = 90 * 24 * time.Hour
+	statsWindow    = 24 * time.Hour
+	maxLatencyWin  = 7 * 24 * time.Hour
 )
 
 // Options configures the server; zero values take the defaults noted below.
 type Options struct {
-	// Token protects every endpoint except /status and /health. Empty disables auth,
-	// which main only allows on a loopback address.
+	// Token protects every endpoint except /status, /health and the login flow.
+	// Empty disables auth unless RequireLogin is set; main only allows that on a
+	// loopback address.
 	Token string
+	// RequireLogin asks for a dashboard session even without a token.
+	RequireLogin bool
+	// SecureCookie marks the session cookie Secure (HTTPS only).
+	SecureCookie bool
+	// SessionTTL is how long a dashboard login lasts (default 7 days).
+	SessionTTL time.Duration
+	// TrustedProxies are the reverse proxies whose X-Forwarded-For is believed
+	// when picking the client IP for rate limits.
+	TrustedProxies []netip.Prefix
+	// Frontend serves every path outside /api/; nil serves nothing there.
+	Frontend http.Handler
 	// AllowPrivate accepts loopback and private targets at validation time.
 	AllowPrivate bool
 	// MaxChecks caps how many checks can exist (default 200).
@@ -61,12 +83,13 @@ type Options struct {
 
 // Server holds the handlers' dependencies.
 type Server struct {
-	store   Store
-	log     *slog.Logger
-	opts    Options
-	now     func() time.Time
-	status  *statusCache
-	limiter *rateLimiter
+	store        Store
+	log          *slog.Logger
+	opts         Options
+	now          func() time.Time
+	status       *statusCache
+	limiter      *rateLimiter
+	loginLimiter *rateLimiter
 }
 
 // New returns a Server.
@@ -80,13 +103,17 @@ func New(store Store, log *slog.Logger, opts Options) *Server {
 	if opts.StatusRate <= 0 {
 		opts.StatusRate = 60
 	}
+	if opts.SessionTTL <= 0 {
+		opts.SessionTTL = sessionTTLDefault
+	}
 	return &Server{
-		store:   store,
-		log:     log,
-		opts:    opts,
-		now:     time.Now,
-		status:  &statusCache{ttl: opts.StatusTTL},
-		limiter: newRateLimiter(opts.StatusRate, time.Minute),
+		store:        store,
+		log:          log,
+		opts:         opts,
+		now:          time.Now,
+		status:       &statusCache{ttl: opts.StatusTTL},
+		limiter:      newRateLimiter(opts.StatusRate, time.Minute),
+		loginLimiter: newRateLimiter(10, time.Minute),
 	}
 }
 
@@ -102,38 +129,38 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/checks/{id}", s.deleteCheck)
 	mux.HandleFunc("GET /api/v1/checks/{id}/results", s.listResults)
 	mux.HandleFunc("GET /api/v1/checks/{id}/uptime", s.uptime)
+	mux.HandleFunc("GET /api/v1/checks/{id}/latency", s.latency)
+	mux.HandleFunc("GET /api/v1/summary", s.summary)
+	mux.HandleFunc("POST /api/v1/auth/login", s.login)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
+	mux.HandleFunc("GET /api/v1/auth/me", s.me)
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) { notFound(w, "no such endpoint") })
+	if s.opts.Frontend != nil {
+		mux.Handle("/", s.opts.Frontend)
+	}
 	return s.recoverer(s.logRequests(securityHeaders(s.authenticate(mux))))
 }
 
-// ---- auth and headers ----
+// ---- headers ----
 
-func isPublic(r *http.Request) bool {
-	read := r.Method == http.MethodGet || r.Method == http.MethodHead
-	return read && (r.URL.Path == "/api/v1/status" || r.URL.Path == "/api/v1/health")
-}
-
-func (s *Server) authenticate(next http.Handler) http.Handler {
-	if s.opts.Token == "" {
-		return next
-	}
-	want := []byte("Bearer " + s.opts.Token)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isPublic(r) && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="watchkeeper"`)
-			unauthorized(w)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
+// frontendCSP allows only the app's own scripts, styles, fonts and API calls.
+// React sets style properties through the DOM, which style-src does not block.
+const frontendCSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+	"font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
-		if !isPublic(r) {
-			h.Set("Cache-Control", "no-store")
+		h.Set("X-Frame-Options", "DENY")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+			if !isPublic(r) || strings.HasPrefix(r.URL.Path, "/api/v1/auth/") {
+				h.Set("Cache-Control", "no-store")
+			}
+		} else {
+			h.Set("Content-Security-Policy", frontendCSP)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -163,6 +190,11 @@ type checkView struct {
 	check.Check
 	Status     check.Status  `json:"status"`
 	LastResult *check.Result `json:"lastResult,omitempty"`
+	// Filled by the list endpoint only.
+	Uptime24h *float64   `json:"uptime24h,omitempty"`
+	P95MS24h  *float64   `json:"p95Ms24h,omitempty"`
+	Uptime90  *float64   `json:"uptime90,omitempty"`
+	Daily     []*float64 `json:"daily,omitempty"` // 90 daily percentages, oldest first; null = no runs
 }
 
 func (s *Server) listChecks(w http.ResponseWriter, r *http.Request) {
@@ -176,9 +208,33 @@ func (s *Server) listChecks(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "recent results", err)
 		return
 	}
+	now := s.now()
+	stats, err := s.store.StatsSince(r.Context(), now.Add(-statsWindow))
+	if err != nil {
+		s.fail(w, r, "check stats", err)
+		return
+	}
+	uptime, err := s.store.UptimeSince(r.Context(), now.Add(-statusLookback))
+	if err != nil {
+		s.fail(w, r, "uptime", err)
+		return
+	}
+	daily, err := s.store.DailyUptimeAll(r.Context(), maxUptimeDays, now)
+	if err != nil {
+		s.fail(w, r, "daily uptime", err)
+		return
+	}
 	out := make([]checkView, 0, len(checks))
 	for _, c := range checks {
-		out = append(out, view(c, recent[c.ID]))
+		v := view(c, recent[c.ID])
+		if st, ok := stats[c.ID]; ok {
+			v.Uptime24h, v.P95MS24h = &st.Uptime, st.P95
+		}
+		if u, ok := uptime[c.ID]; ok {
+			v.Uptime90 = &u
+		}
+		v.Daily = percents(daily[c.ID], maxUptimeDays)
+		out = append(out, v)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": out})
 }
@@ -197,8 +253,20 @@ type checkInput struct {
 	Target         *string     `json:"target"`
 	IntervalS      *int        `json:"intervalS"`
 	TimeoutMS      *int        `json:"timeoutMs"`
-	ExpectedStatus *int        `json:"expectedStatus"`
+	ExpectedStatus optionalInt `json:"expectedStatus"`
 	Enabled        *bool       `json:"enabled"`
+}
+
+// optionalInt tells a missing field (keep the value) from an explicit null
+// (clear it), which a plain *int cannot.
+type optionalInt struct {
+	set bool
+	v   *int
+}
+
+func (o *optionalInt) UnmarshalJSON(b []byte) error {
+	o.set = true
+	return json.Unmarshal(b, &o.v)
 }
 
 func (in checkInput) apply(c *check.Check) {
@@ -217,8 +285,8 @@ func (in checkInput) apply(c *check.Check) {
 	if in.TimeoutMS != nil {
 		c.TimeoutMS = *in.TimeoutMS
 	}
-	if in.ExpectedStatus != nil {
-		c.ExpectedStatus = in.ExpectedStatus
+	if in.ExpectedStatus.set {
+		c.ExpectedStatus = in.ExpectedStatus.v
 	}
 	if in.Enabled != nil {
 		c.Enabled = *in.Enabled
@@ -446,6 +514,80 @@ func (s *Server) uptime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+}
+
+// percents flattens a daily series to its percentages; a missing series becomes
+// n days without data.
+func percents(days []store.DayUptime, n int) []*float64 {
+	out := make([]*float64, n)
+	for i, d := range days {
+		if i < n {
+			out[i] = d.Percent
+		}
+	}
+	return out
+}
+
+func (s *Server) latency(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.loadCheck(w, r)
+	if !ok {
+		return
+	}
+	window := 24 * time.Hour
+	if v := r.URL.Query().Get("window"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < time.Hour || d > maxLatencyWin || d%time.Hour != 0 {
+			invalid(w, []check.FieldError{{Field: "window", Message: "must be a whole number of hours between 1h and 168h"}})
+			return
+		}
+		window = d
+	}
+	// The window ends after the current hour, so the latest runs are included.
+	to := s.now().UTC().Truncate(time.Hour).Add(time.Hour)
+	data, err := s.store.HourlyLatency(r.Context(), c.ID, to.Add(-window), to)
+	if err != nil {
+		s.fail(w, r, "hourly latency", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+}
+
+// summary is the KPI row of the dashboard: last 24 hours of enabled checks.
+func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
+	checks, err := s.store.ListChecks(r.Context())
+	if err != nil {
+		s.fail(w, r, "list checks", err)
+		return
+	}
+	recent, err := s.store.RecentResults(r.Context(), 3)
+	if err != nil {
+		s.fail(w, r, "recent results", err)
+		return
+	}
+	sum, err := s.store.SummarySince(r.Context(), s.now().Add(-statsWindow))
+	if err != nil {
+		s.fail(w, r, "summary", err)
+		return
+	}
+	counts := map[check.Status]int{}
+	enabled := 0
+	for _, c := range checks {
+		if c.Enabled {
+			enabled++
+			counts[check.StatusFrom(recent[c.ID])]++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
+		"checks":      len(checks),
+		"enabled":     enabled,
+		"operational": counts[check.StatusOperational],
+		"degraded":    counts[check.StatusDegraded],
+		"down":        counts[check.StatusDown],
+		"unknown":     counts[check.StatusUnknown],
+		"uptime24h":   sum.Uptime,
+		"p95Ms24h":    sum.P95,
+		"runs24h":     sum.Total,
+	}})
 }
 
 // ---- helpers and middleware ----

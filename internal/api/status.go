@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,7 @@ type statusCheck struct {
 	Status        check.Status `json:"status"`
 	Uptime90      *float64     `json:"uptime90"`
 	LastCheckedAt *time.Time   `json:"lastCheckedAt"`
+	Daily         []*float64   `json:"daily"` // 90 daily percentages, oldest first; null = no runs
 }
 
 // statusCache keeps the encoded public status for a short time, so a burst of
@@ -33,7 +36,7 @@ type statusCache struct {
 // publicStatus is the summary for a status page: names and states only, never
 // targets, errors or timings.
 func (s *Server) publicStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.limiter.allow(clientIP(r), s.now()) {
+	if !s.limiter.allow(s.clientIP(r), s.now()) {
 		w.Header().Set("Retry-After", "60")
 		tooManyRequests(w)
 		return
@@ -69,6 +72,10 @@ func (s *Server) buildStatus(ctx context.Context, now time.Time) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	daily, err := s.store.DailyUptimeAll(ctx, maxUptimeDays, now)
+	if err != nil {
+		return nil, err
+	}
 
 	out := []statusCheck{}
 	var statuses []check.Status
@@ -76,7 +83,8 @@ func (s *Server) buildStatus(ctx context.Context, now time.Time) ([]byte, error)
 		if !c.Enabled {
 			continue
 		}
-		sc := statusCheck{ID: c.ID, Name: c.Name, Kind: c.Kind, Status: check.StatusFrom(recent[c.ID])}
+		sc := statusCheck{ID: c.ID, Name: c.Name, Kind: c.Kind, Status: check.StatusFrom(recent[c.ID]),
+			Daily: percents(daily[c.ID], maxUptimeDays)}
 		if u, ok := uptime[c.ID]; ok {
 			sc.Uptime90 = &u
 		}
@@ -94,8 +102,7 @@ func (s *Server) buildStatus(ctx context.Context, now time.Time) ([]byte, error)
 }
 
 // rateLimiter is a fixed-window counter per client IP. It is small on purpose:
-// one process, one public endpoint. Behind a reverse proxy, RemoteAddr is the
-// proxy, so phase 2 must read the client IP from a trusted header instead.
+// one process and a couple of public endpoints.
 type rateLimiter struct {
 	limit  int
 	window time.Duration
@@ -118,10 +125,40 @@ func (l *rateLimiter) allow(ip string, now time.Time) bool {
 	return l.counts[ip] <= l.limit
 }
 
-func clientIP(r *http.Request) string {
+// clientIP is the address rate limits count. Behind a trusted reverse proxy it
+// walks X-Forwarded-For from the right and returns the first address that is
+// not a trusted proxy, so a client cannot spoof it by sending the header itself.
+func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if !s.trusted(host) {
+		return host
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(hops[i])
+		if hop == "" {
+			continue
+		}
+		if !s.trusted(hop) {
+			return hop
+		}
 	}
 	return host
+}
+
+func (s *Server) trusted(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range s.opts.TrustedProxies {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
