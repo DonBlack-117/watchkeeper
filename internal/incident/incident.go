@@ -42,6 +42,9 @@ type Options struct {
 	AlertOnDegraded bool
 	// PublicURL, when set, adds a dashboard link to each alert.
 	PublicURL string
+	// OnDown, when set, is called when an incident opens as down or escalates
+	// to down; main uses it to start the AI investigation.
+	OnDown func(ctx context.Context, incidentID int64)
 }
 
 // Manager is called by the scheduler after each saved result.
@@ -86,6 +89,9 @@ func (m *Manager) alert(ctx context.Context, c check.Check, res check.Result, tr
 		if tr.Kind != store.NoChange {
 			m.log.Warn("incident", "event", map[store.TransitionKind]string{store.Opened: "opened", store.Changed: "changed"}[tr.Kind],
 				"incident_id", inc.ID, "check_id", c.ID, "name", c.Name, "status", inc.Status, "error", res.Error)
+			if inc.Status == check.StatusDown && m.opts.OnDown != nil {
+				defer m.opts.OnDown(ctx, inc.ID) // after the alert, so it is queued first
+			}
 		}
 		// Checked on every run while the incident is open, so an alert that
 		// could not be queued or recorded goes out on the next run.

@@ -10,18 +10,24 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 
 	"github.com/DonBlack-117/watchkeeper/internal/api"
 	"github.com/DonBlack-117/watchkeeper/internal/check"
 	"github.com/DonBlack-117/watchkeeper/internal/config"
 	"github.com/DonBlack-117/watchkeeper/internal/incident"
+	"github.com/DonBlack-117/watchkeeper/internal/mcp"
 	"github.com/DonBlack-117/watchkeeper/internal/metrics"
 	"github.com/DonBlack-117/watchkeeper/internal/notify"
 	"github.com/DonBlack-117/watchkeeper/internal/scheduler"
 	"github.com/DonBlack-117/watchkeeper/internal/store"
+	"github.com/DonBlack-117/watchkeeper/internal/triage"
 	"github.com/DonBlack-117/watchkeeper/internal/ui"
 )
 
@@ -39,6 +45,14 @@ func main() {
 	// runs the binary itself: watchkeeper healthcheck.
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(healthcheck())
+	}
+	// watchkeeper mcp: a Model Context Protocol server on stdio for AI assistants.
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		if err := serveMCP(); err != nil {
+			fmt.Fprintln(os.Stderr, "watchkeeper mcp:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if err := run(); err != nil {
 		slog.Error("watchkeeper stopped", "err", err)
@@ -88,11 +102,17 @@ func run() error {
 		notifiers = append(notifiers, notify.NewTelegram(cfg.TelegramToken, cfg.TelegramChatID))
 	}
 	alerts := notify.NewDispatcher(log, m, notifiers...)
-	incidents := incident.New(st, alerts, log, incident.Options{
+	runner := check.NewRunner(cfg.AllowPrivate)
+	triager := newTriage(ctx, cfg, st, runner, alerts, m, log)
+	incidentOpts := incident.Options{
 		AlertOnDegraded: cfg.AlertOnDegraded,
 		PublicURL:       cfg.PublicURL,
-	})
-	sched = scheduler.New(st, check.NewRunner(cfg.AllowPrivate), log, scheduler.Options{
+	}
+	if triager != nil {
+		incidentOpts.OnDown = triager.IncidentDown
+	}
+	incidents := incident.New(st, alerts, log, incidentOpts)
+	sched = scheduler.New(st, runner, log, scheduler.Options{
 		MaxConcurrent:  cfg.MaxConcurrent,
 		ReloadInterval: cfg.ReloadInterval,
 		OnResult: func(ctx context.Context, c check.Check, res check.Result) {
@@ -103,7 +123,7 @@ func run() error {
 			incidents.Process(ictx, c, res)
 		},
 	})
-	handler := api.New(st, log, api.Options{
+	apiOpts := api.Options{
 		Token:          cfg.APIToken,
 		AllowPrivate:   cfg.AllowPrivate,
 		MaxChecks:      cfg.MaxChecks,
@@ -114,7 +134,11 @@ func run() error {
 		Frontend:       ui.Handler(),
 		Metrics:        m,
 		Alerts:         alerts,
-	}).Handler()
+	}
+	if triager != nil {
+		apiOpts.Triage = triager
+	}
+	handler := api.New(st, log, apiOpts).Handler()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
@@ -135,6 +159,11 @@ func run() error {
 	alertsCtx, stopAlerts := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopAlerts()
 	go alerts.Run(alertsCtx, alertDrain)
+	// Investigations stop with the alerts, so a diagnosis that finishes during
+	// shutdown can still be queued.
+	if triager != nil {
+		go triager.Run(alertsCtx)
+	}
 	go prune(ctx, st, cfg.RetentionDays, log)
 	go func() {
 		log.Info("listening", "addr", cfg.Addr, "token", cfg.APIToken != "", "login", cfg.AdminUser != "",
@@ -181,11 +210,40 @@ func run() error {
 	}
 	// Alerts queued by the last runs still go out, within alertDrain.
 	stopAlerts()
+	if triager != nil {
+		select {
+		case <-triager.Done():
+		case <-shutdownCtx.Done():
+		}
+	}
 	select {
 	case <-alerts.Done():
 	case <-shutdownCtx.Done():
 	}
 	return err
+}
+
+// newTriage returns the AI investigation service, or nil without an API key.
+func newTriage(ctx context.Context, cfg config.Config, st *store.Store, runner *check.Runner,
+	alerts *notify.Dispatcher, m *metrics.Metrics, log *slog.Logger) *triage.Service {
+	if cfg.AnthropicKey == "" {
+		log.Info("AI triage disabled: set WK_ANTHROPIC_API_KEY to enable it")
+		return nil
+	}
+	if n, err := st.FailStaleTriages(ctx, time.Now()); err != nil {
+		log.Error("triage: clear interrupted runs", "err", err)
+	} else if n > 0 {
+		log.Warn("triage: marked runs interrupted by a restart as failed", "count", n)
+	}
+	client := anthropic.NewClient(option.WithAPIKey(cfg.AnthropicKey), option.WithRequestTimeout(2*time.Minute))
+	agent := triage.NewAgent(&client.Beta.Messages, cfg.TriageModel, cfg.TriageEffort)
+	log.Info("AI triage enabled", "model", cfg.TriageModel, "effort", cfg.TriageEffort,
+		"auto", cfg.TriageAuto, "daily_limit", cfg.TriageDailyLimit)
+	return triage.NewService(agent, st, runner, alerts, m, log, triage.Options{
+		Auto:       cfg.TriageAuto,
+		DailyLimit: cfg.TriageDailyLimit,
+		PublicURL:  cfg.PublicURL,
+	})
 }
 
 func connect(ctx context.Context, url string, log *slog.Logger) (*store.Store, error) {
@@ -220,6 +278,33 @@ func ensureAdmin(ctx context.Context, st *store.Store, user, password string) er
 		return fmt.Errorf("admin account: %w", err)
 	}
 	return nil
+}
+
+// serveMCP runs the MCP server against the API at WK_URL. stdout carries the
+// protocol, so logs go to stderr.
+func serveMCP() error {
+	client, err := mcp.NewClient(env("WK_URL", "http://127.0.0.1:8090"), os.Getenv("WK_API_TOKEN"))
+	if err != nil {
+		return err
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return mcp.NewServer(mcp.Tools(client), version(), log).Serve(ctx, os.Stdin, os.Stdout)
+}
+
+func version() string {
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // healthcheck asks the running server for /api/v1/health on its own port.

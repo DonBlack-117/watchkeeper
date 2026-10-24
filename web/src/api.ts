@@ -132,6 +132,11 @@ export const api = {
   incidents: (signal?: AbortSignal) =>
     request<Incident[]>("GET", "/api/v1/incidents?limit=10", undefined, signal),
   testAlert: () => request<undefined>("POST", "/api/v1/alerts/test"),
+  investigate: (incidentId: number) =>
+    request<{ triageId: number }>(
+      "POST",
+      `/api/v1/incidents/${incidentId}/triage`,
+    ),
 
   status: (signal?: AbortSignal) =>
     request<PublicStatus>("GET", "/api/v1/status", undefined, signal),

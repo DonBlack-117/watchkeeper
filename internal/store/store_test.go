@@ -397,3 +397,88 @@ func TestIncidentLifecycle(t *testing.T) {
 		t.Fatal("deleting a check must delete its incidents")
 	}
 }
+
+func TestTriage(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	c, err := s.CreateCheck(ctx, sample("api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	tr, err := s.ApplyStatus(ctx, c.ID, check.StatusDown, t0, "timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	incID := tr.Incident.ID
+
+	inc, err := s.GetIncident(ctx, incID)
+	if err != nil || inc.CheckName != "api" || len(inc.Updates) != 1 || inc.Updates[0].Error != "timeout" {
+		t.Fatalf("GetIncident = %+v, %v", inc, err)
+	}
+	if _, err := s.GetIncident(ctx, 9999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown incident: %v", err)
+	}
+	if _, err := s.LatestTriage(ctx, incID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("no triage yet: %v", err)
+	}
+
+	id, err := s.StartTriage(ctx, incID, "auto", "claude-opus-5-5", t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StartTriage(ctx, incID, "manual", "claude-opus-5-5", t0.Add(time.Minute)); !errors.Is(err, ErrTriageRunning) {
+		t.Errorf("second running triage: %v", err)
+	}
+	if _, err := s.StartTriage(ctx, 9999, "manual", "m", t0); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown incident: %v", err)
+	}
+	report := TriageReport{Summary: "The host stopped answering.", ProbableCause: "Server down.", Confidence: "medium",
+		Evidence: []string{"probe_now: timeout"}, ToolCalls: []ToolCall{{Name: "probe_now", Outcome: "failed: timeout in 5000 ms"}},
+		InputTokens: 1200, OutputTokens: 300}
+	if err := s.FinishTriage(ctx, id, report, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestTriage(ctx, incID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != TriageDone || got.Summary != report.Summary || got.Confidence != "medium" || got.NextSteps == nil ||
+		len(got.Evidence) != 1 || len(got.ToolCalls) != 1 || got.InputTokens != 1200 || got.FinishedAt == nil || got.Trigger != "auto" {
+		t.Errorf("LatestTriage = %+v", got)
+	}
+
+	// A newer manual run replaces it in the incident list.
+	id2, err := s.StartTriage(ctx, incID, "manual", "claude-opus-5-5", t0.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListIncidents(ctx, IncidentQuery{})
+	if err != nil || len(list) != 1 || list[0].Triage == nil || list[0].Triage.ID != id2 || list[0].Triage.State != TriageRunning {
+		t.Fatalf("ListIncidents = %+v, %v", list, err)
+	}
+	if n, err := s.FailStaleTriages(ctx, t0.Add(4*time.Minute)); err != nil || n != 1 {
+		t.Errorf("FailStaleTriages = %d, %v", n, err)
+	}
+	got, _ = s.LatestTriage(ctx, incID)
+	if got.State != TriageFailed || got.Error != "interrupted by a restart" {
+		t.Errorf("after restart: %+v", got)
+	}
+	if err := s.FailTriage(ctx, id2, "the investigation timed out", nil, 10, 2, t0.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.CountTriagesSince(ctx, t0); err != nil || n != 2 {
+		t.Errorf("CountTriagesSince = %d, %v", n, err)
+	}
+	if n, _ := s.CountTriagesSince(ctx, t0.Add(150*time.Second)); n != 1 {
+		t.Errorf("CountTriagesSince later = %d", n)
+	}
+
+	// Deleting the check removes its incidents and their investigations.
+	if err := s.DeleteCheck(ctx, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LatestTriage(ctx, incID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("after delete: %v", err)
+	}
+}

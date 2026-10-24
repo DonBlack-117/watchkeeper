@@ -80,7 +80,15 @@ From then on each push to `main` builds, tests, publishes `ghcr.io/donblack-117/
 
 Watchkeeper alerts when a check goes down, when it recovers (only if the outage was announced) and 30 and 14 days before a certificate expires. Set `WK_ALERT_ON_DEGRADED=true` to also hear about slow or flapping checks.
 
-## 6. Observability (optional)
+## 6. AI triage (optional)
+
+1. Create an API key at <https://platform.claude.com>, and set a monthly spend limit for it there.
+2. On the server, set `WK_ANTHROPIC_API_KEY` in `.env` and run `docker compose up -d app`. The log line `AI triage enabled` confirms it.
+3. The Incidents card shows **AI triage: claude-opus-5-5**. Every incident that goes down is investigated once; press **Investigate with Claude** on any incident to run it by hand.
+
+`WK_TRIAGE_DAILY_LIMIT` (20) caps the investigations per day. See [triage.md](triage.md) for what is sent to the API and what it costs.
+
+## 7. Observability (optional)
 
 Prometheus, Loki, Alloy and Grafana run in the `observability` Compose profile. Set `GRAFANA_ADMIN_PASSWORD` (12 or more characters) and the Telegram variables in `.env`, then:
 

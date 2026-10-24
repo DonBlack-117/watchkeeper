@@ -55,6 +55,8 @@ export type CheckPatch = Omit<CheckInput, "expectedStatus"> & {
 };
 
 export interface Summary {
+  /** AI incident triage: whether it is configured and the model it uses. */
+  triage: { enabled: boolean; model?: string };
   openIncidents: number;
   /** Configured alert channels, for example ["telegram"]. */
   alertChannels: string[];
@@ -96,6 +98,34 @@ export interface IncidentUpdate {
   error?: string;
 }
 
+export type TriageState = "running" | "done" | "failed";
+
+export interface ToolCall {
+  name: string;
+  input?: string;
+  outcome: string;
+}
+
+/** The newest AI investigation of an incident (dashboard only). */
+export interface Triage {
+  id: number;
+  incidentId: number;
+  state: TriageState;
+  trigger: "auto" | "manual";
+  model: string;
+  summary?: string;
+  probableCause?: string;
+  confidence?: "low" | "medium" | "high";
+  evidence: string[];
+  nextSteps: string[];
+  toolCalls: ToolCall[];
+  inputTokens: number;
+  outputTokens: number;
+  error?: string;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
 export interface Incident {
   id: number;
   checkId: number;
@@ -104,6 +134,7 @@ export interface Incident {
   startedAt: string;
   resolvedAt: string | null;
   updates: IncidentUpdate[];
+  triage?: Triage;
 }
 
 export interface PublicIncident {

@@ -34,6 +34,7 @@ export function Dashboard({
   const summary = usePoll(api.summary, REFRESH_MS);
   const incidentPoll = usePoll(api.incidents, REFRESH_MS);
   const [testing, setTesting] = useState(false);
+  const [starting, setStarting] = useState<ReadonlySet<number>>(new Set());
   const [selectedId, setSelectedId] = useState<number>();
   const [editing, setEditing] = useState<Check | "new">();
   const [deleting, setDeleting] = useState<Check>();
@@ -118,6 +119,42 @@ export function Dashboard({
 
   const s = summary.data;
   const alertsOn = (s?.alertChannels.length ?? 0) > 0;
+
+  const triageOn = s?.triage.enabled ?? false;
+  const investigating = (incidentPoll.data ?? []).some(
+    (i) => i.triage?.state === "running",
+  );
+
+  // While Claude works, refresh the incidents every 5 s instead of every 30 s.
+  useEffect(() => {
+    if (!investigating) return;
+    const t = setInterval(reloadIncidents, 5000);
+    return () => {
+      clearInterval(t);
+    };
+  }, [investigating, reloadIncidents]);
+
+  const investigate = async (incidentId: number) => {
+    setStarting((prev) => new Set(prev).add(incidentId));
+    try {
+      await api.investigate(incidentId);
+      setToast("Claude is investigating the incident.");
+    } catch (e) {
+      setToast(
+        e instanceof Error
+          ? `Could not start the investigation: ${e.message}`
+          : "Could not start the investigation.",
+      );
+    } finally {
+      // The incident list shows "running" from here on.
+      reloadIncidents();
+      setStarting((prev) => {
+        const next = new Set(prev);
+        next.delete(incidentId);
+        return next;
+      });
+    }
+  };
 
   const testAlert = async () => {
     setTesting(true);
@@ -275,6 +312,10 @@ export function Dashboard({
                   {alertsOn
                     ? `Alerts: ${s.alertChannels.join(", ")}`
                     : "Alerts off: set WK_TELEGRAM_BOT_TOKEN"}
+                  {" · "}
+                  {triageOn
+                    ? `AI triage: ${s.triage.model ?? "on"}`
+                    : "AI triage off: set WK_ANTHROPIC_API_KEY"}
                 </span>
                 {alertsOn && (
                   <button
@@ -302,6 +343,11 @@ export function Dashboard({
                   name: i.checkName,
                 }))}
                 empty="No incidents yet."
+                triage={{
+                  enabled: triageOn,
+                  starting,
+                  onInvestigate: (id) => void investigate(id),
+                }}
               />
             ) : (
               <p className="empty" aria-busy="true">

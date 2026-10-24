@@ -939,3 +939,131 @@ dialog::backdrop {
 .incident-empty svg {
   color: var(--ok);
 }
+
+/* ---- AI triage ---- */
+
+.btn-small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.triage-actions {
+  margin-top: 4px;
+}
+
+.triage {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-hover);
+  font-size: 13px;
+}
+
+.triage-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.triage-head .btn {
+  margin-left: auto;
+}
+
+.triage-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.triage-title svg {
+  color: var(--accent);
+}
+
+.confidence {
+  padding: 1px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.confidence-high {
+  border-color: var(--ok);
+}
+
+.confidence-low {
+  border-color: var(--slow);
+}
+
+.triage p {
+  margin: 0;
+}
+
+.triage h4 {
+  margin: 6px 0 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.triage-summary {
+  font-weight: 500;
+}
+
+.triage-cause,
+.triage-list {
+  color: var(--text-muted);
+}
+
+.triage-list,
+.triage-tools {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.triage-tools li {
+  overflow-wrap: anywhere;
+}
+
+.triage-tools li > * + * {
+  margin-left: 6px;
+}
+
+.triage-running {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+}
+
+.triage-failed {
+  color: var(--down);
+}
+
+.triage-details summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.triage-meta {
+  margin-top: 6px !important;
+  font-size: 11px;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

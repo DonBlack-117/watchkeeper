@@ -98,3 +98,39 @@ func TestTelegramAndMetricsSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestTriageSettings(t *testing.T) {
+	t.Setenv("WK_ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AnthropicKey != "" || c.TriageModel != DefaultTriageModel || c.TriageEffort != "high" || !c.TriageAuto || c.TriageDailyLimit != 20 {
+		t.Errorf("defaults: %+v", c)
+	}
+
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-api03-from-the-sdk-variable")
+	if c, _ = Load(); c.AnthropicKey != "sk-ant-api03-from-the-sdk-variable" {
+		t.Error("ANTHROPIC_API_KEY is the fallback")
+	}
+	t.Setenv("WK_ANTHROPIC_API_KEY", "sk-ant-api03-watchkeeper-specific")
+	if c, _ = Load(); c.AnthropicKey != "sk-ant-api03-watchkeeper-specific" {
+		t.Error("WK_ANTHROPIC_API_KEY wins")
+	}
+
+	for key, value := range map[string]string{
+		"WK_TRIAGE_EFFORT":      "extreme",
+		"WK_TRIAGE_MODEL":       "Claude Opus",
+		"WK_TRIAGE_AUTO":        "maybe",
+		"WK_TRIAGE_DAILY_LIMIT": "0",
+		"WK_ANTHROPIC_API_KEY":  "short",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Errorf("%s=%q: err = %v", key, value, err)
+			}
+		})
+	}
+}

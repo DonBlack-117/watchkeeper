@@ -60,6 +60,7 @@ const dashboardRoutes: Record<string, Route> = {
     status: 200,
     body: {
       data: {
+        triage: { enabled: false },
         openIncidents: 1,
         alertChannels: ["telegram"],
         checks: 1,
@@ -359,5 +360,86 @@ describe("App", () => {
       await screen.findByText("Test alert sent. Check the Telegram chat."),
     ).toBeInTheDocument();
     expect(calls.some((c) => c.key === "POST /api/v1/alerts/test")).toBe(true);
+  });
+  it("shows the AI diagnosis and starts an investigation", async () => {
+    const summaryRoute = dashboardRoutes["GET /api/v1/summary"];
+    if (!summaryRoute) throw new Error("no summary route");
+    const summaryBody = summaryRoute(undefined).body as { data: object };
+    let investigated = false;
+    const calls = stubFetch({
+      ...dashboardRoutes,
+      "GET /api/v1/summary": () => ({
+        status: 200,
+        body: {
+          data: {
+            ...summaryBody.data,
+            triage: { enabled: true, model: "claude-opus-5-5" },
+          },
+        },
+      }),
+      "GET /api/v1/incidents": () => ({
+        status: 200,
+        body: {
+          data: [
+            {
+              id: 7,
+              checkId: 1,
+              checkName: "Bitso API",
+              status: "down",
+              startedAt: "2026-10-19T10:00:00Z",
+              resolvedAt: null,
+              updates: [
+                {
+                  at: "2026-10-19T10:00:00Z",
+                  status: "down",
+                  error: "timeout",
+                },
+              ],
+              ...(investigated
+                ? {
+                    triage: {
+                      id: 1,
+                      incidentId: 7,
+                      state: "running",
+                      trigger: "manual",
+                      model: "claude-opus-5-5",
+                      evidence: [],
+                      nextSteps: [],
+                      toolCalls: [],
+                      inputTokens: 0,
+                      outputTokens: 0,
+                      startedAt: "2026-10-19T10:05:00Z",
+                      finishedAt: null,
+                    },
+                  }
+                : {}),
+            },
+          ],
+        },
+      }),
+      "POST /api/v1/incidents/7/triage": () => {
+        investigated = true;
+        return { status: 202, body: { data: { triageId: 1 } } };
+      },
+    });
+    render(<App />);
+    const user = userEvent.setup();
+    expect(
+      await screen.findByText(/AI triage: claude-opus-5-5/),
+    ).toBeInTheDocument();
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Investigate with Claude (Bitso API)",
+      }),
+    );
+    expect(
+      await screen.findByText(/Claude is investigating: checking DNS/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Investigate/ }),
+    ).not.toBeInTheDocument();
+    expect(calls.some((c) => c.key === "POST /api/v1/incidents/7/triage")).toBe(
+      true,
+    );
   });
 });

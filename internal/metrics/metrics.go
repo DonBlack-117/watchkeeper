@@ -24,6 +24,8 @@ type Metrics struct {
 	httpRequests  *prometheus.CounterVec
 	httpDuration  *prometheus.HistogramVec
 	notifications *prometheus.CounterVec
+	triages       *prometheus.CounterVec
+	triageTokens  *prometheus.CounterVec
 	checks        *checkCollector
 }
 
@@ -67,12 +69,21 @@ func New(src Sources) *Metrics {
 			Name: "watchkeeper_notifications_total",
 			Help: "Alert deliveries by channel and result (sent, error, dropped).",
 		}, []string{"channel", "result"}),
+		triages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "watchkeeper_triage_runs_total",
+			Help: "AI incident investigations by result (done or failed).",
+		}, []string{"result"}),
+		triageTokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "watchkeeper_triage_tokens_total",
+			Help: "Tokens used by AI incident investigations, by direction (input or output).",
+		}, []string{"direction"}),
 		checks: &checkCollector{running: src.Running, state: map[int64]checkState{}},
 	}
 	m.reg.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		m.runs, m.phases, m.httpRequests, m.httpDuration, m.notifications, m.checks,
+		m.runs, m.phases, m.httpRequests, m.httpDuration, m.notifications,
+		m.triages, m.triageTokens, m.checks,
 	)
 	if src.Running != nil {
 		m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -130,6 +141,13 @@ func (m *Metrics) ObserveRun(c check.Check, r check.Result) {
 func (m *Metrics) ObserveHTTP(route, method string, code int, d time.Duration) {
 	m.httpRequests.WithLabelValues(route, method, strconv.Itoa(code)).Inc()
 	m.httpDuration.WithLabelValues(route).Observe(d.Seconds())
+}
+
+// ObserveTriage records one finished AI investigation.
+func (m *Metrics) ObserveTriage(result string, inputTokens, outputTokens int) {
+	m.triages.WithLabelValues(result).Inc()
+	m.triageTokens.WithLabelValues("input").Add(float64(inputTokens))
+	m.triageTokens.WithLabelValues("output").Add(float64(outputTokens))
 }
 
 // Notification implements notify.Recorder.

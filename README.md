@@ -4,11 +4,13 @@
 
 Uptime monitor and status page with AI incident triage, written in Go.
 
-Watchkeeper checks your HTTP endpoints, DNS records and TLS certificates on a schedule, stores every run in PostgreSQL, and shows the results in a React dashboard and a public status page. It opens an incident when a service goes down, alerts you on Telegram, and exports Prometheus metrics and JSON logs to a Grafana dashboard with Loki. It ships as one container image and deploys to AWS from GitHub Actions. The last phase adds an agent that uses Claude to investigate incidents.
+Watchkeeper checks your HTTP endpoints, DNS records and TLS certificates on a schedule, stores every run in PostgreSQL, and shows the results in a React dashboard and a public status page. It opens an incident when a service goes down, alerts you on Telegram, and exports Prometheus metrics and JSON logs to a Grafana dashboard with Loki. When an incident opens, an agent built on Claude tool use investigates it with DNS, HTTP and TLS probes and the check's history, and writes the probable cause next to the alert. An MCP server lets Claude Code or Claude Desktop query and operate it. It ships as one container image and deploys to AWS from GitHub Actions.
 
-> **Status:** phases 1 (Go core), 2 (dashboard and deployment) and 3 (incidents, alerts and observability) are done. See the [roadmap](#roadmap).
+> **Status:** all four phases are done: Go core, dashboard and deployment, observability, and AI triage with an MCP server. See the [roadmap](#roadmap).
 
 ![Dashboard](docs/screenshots/dashboard.png)
+
+![AI diagnosis of an incident](docs/screenshots/triage.png)
 
 ![Public status page](docs/screenshots/status.png)
 
@@ -28,11 +30,13 @@ Watchkeeper checks your HTTP endpoints, DNS records and TLS certificates on a sc
 - **Incidents:** opened when a check stops being operational, escalated from degraded to down, and resolved on recovery, with a timeline shown in the dashboard and, without error details, on the status page.
 - **Telegram alerts** when a check goes down and when it recovers (with the duration), and 30 and 14 days before a certificate expires. Short blips never alert, delivery is queued with retries, and the dashboard has a "Send test alert" button.
 - **Prometheus metrics** on a separate internal port: check status, phase durations, API traffic and latency, alerts, incidents and Go runtime.
+- **AI incident triage:** a Claude agent investigates each incident once it goes down, using tools that work like `dig`, `curl` and `openssl s_client` plus the stored history, and stores a summary, probable cause, confidence, evidence and next steps. It shows under the incident and follows the Telegram alert. Probes only reach the incident's own check. See [docs/triage.md](docs/triage.md).
+- **MCP server:** `watchkeeper mcp` exposes checks, incidents, investigations and pause/resume to Claude Code or Claude Desktop. See [docs/mcp.md](docs/mcp.md).
 - **Grafana and Loki** in an optional Compose profile, with the data sources, a dashboard and alert rules provisioned from the repository. Grafana alerts on Telegram if Watchkeeper itself stops.
 
 ## Quick start
 
-Requirements: Go 1.26+, Node 22+, and Podman or Docker.
+Requirements: Go 1.26+ (the image builds with 1.27), Node 22+, and Podman or Docker. AI triage also needs an [Anthropic API key](https://platform.claude.com) in `WK_ANTHROPIC_API_KEY`.
 
 ```bash
 make db          # PostgreSQL 16 on 127.0.0.1:5432
@@ -69,6 +73,9 @@ Settings come from environment variables; see [`.env.example`](.env.example).
 | `GET /api/v1/auth/me`                                      | Whether a login is required and who is signed in                 |
 | `GET /api/v1/incidents?limit=&checkId=&open=`              | Incidents newest first, each with its timeline                   |
 | `POST /api/v1/alerts/test`                                 | Sends a test message to every alert channel                      |
+| `GET /api/v1/incidents/{id}`                               | One incident with its timeline and newest investigation          |
+| `POST /api/v1/incidents/{id}/triage`                       | Starts an AI investigation (`202`; result on the incident)       |
+| `GET /api/v1/incidents/{id}/triage`                        | The newest investigation of an incident                          |
 
 Create a check:
 
@@ -123,6 +130,8 @@ internal/store/      PostgreSQL with pgx; embedded goose migrations
 internal/api/        REST handlers, sessions, problem details and request logging
 internal/incident/   incident state machine, alert messages and certificate warnings
 internal/notify/     alert queue with retries; Telegram Bot API client
+internal/triage/     Claude tool-use agent, its tools and the investigation queue
+internal/mcp/        MCP server on stdio over the REST API
 internal/metrics/    Prometheus registry and per-check collectors
 internal/ui/         embeds the built frontend and serves it with SPA fallback
 migrations/          SQL migrations
@@ -143,7 +152,7 @@ deploy/              production Compose stack, Caddyfile, EC2 user data and the
 | Logs    | JSON from `log/slog` on stdout; Alloy ships them to Loki with the `service` and `level` labels        |
 | Alerts  | Watchkeeper sends incident and certificate alerts; Grafana alerts when Watchkeeper is unreachable     |
 
-Main metrics: `watchkeeper_check_up`, `watchkeeper_check_phase_duration_seconds` (histogram by phase), `watchkeeper_check_runs_total`, `watchkeeper_check_cert_expiry_timestamp_seconds`, `watchkeeper_http_requests_total` and `watchkeeper_http_request_duration_seconds` (by route pattern), `watchkeeper_incidents_open` and `watchkeeper_notifications_total`.
+Main metrics: `watchkeeper_triage_runs_total`, `watchkeeper_triage_tokens_total`, `watchkeeper_check_up`, `watchkeeper_check_phase_duration_seconds` (histogram by phase), `watchkeeper_check_runs_total`, `watchkeeper_check_cert_expiry_timestamp_seconds`, `watchkeeper_http_requests_total` and `watchkeeper_http_request_duration_seconds` (by route pattern), `watchkeeper_incidents_open` and `watchkeeper_notifications_total`.
 
 ```bash
 docker compose --profile observability up -d   # on the server, see docs/deploy.md
@@ -156,7 +165,7 @@ Grafana is served at `https://grafana.<domain>`, a separate origin from the dash
 1. **Go core** — checks, scheduler, storage, REST API. ✅
 2. **Dashboard** — React and TypeScript UI, public status page, deployment on AWS with CI/CD. ✅
 3. **Observability** — incidents, Telegram alerts, Prometheus metrics, Loki logs and Grafana. ✅
-4. **AI triage** — an agent that uses Claude tool use (`dig`, `curl`, history queries) to explain incidents, plus an MCP server.
+4. **AI triage** — an agent that uses Claude tool use (`dig`, `curl`, TLS and history queries) to explain incidents, plus an MCP server. ✅
 
 Security reports: see [SECURITY.md](SECURITY.md).
 

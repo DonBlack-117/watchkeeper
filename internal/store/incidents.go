@@ -22,6 +22,8 @@ type Incident struct {
 	ResolvedAt *time.Time       `json:"resolvedAt"`
 	Notified   bool             `json:"-"`
 	Updates    []IncidentUpdate `json:"updates"`
+	// Triage is the newest AI investigation, if any; never shown publicly.
+	Triage *Triage `json:"triage,omitempty"`
 }
 
 // IncidentUpdate is one step of the timeline. Status "resolved" closes it.
@@ -272,7 +274,19 @@ func (s *Store) ListIncidents(ctx context.Context, q IncidentQuery) ([]Incident,
 		i := index[id]
 		out[i].Updates = append(out[i].Updates, u)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	triages, err := s.latestTriages(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, t := range triages {
+		out[index[id]].Triage = &t
+	}
+	return out, nil
 }
 
 // CountOpenIncidents returns how many incidents are open.
