@@ -11,6 +11,15 @@ test("README screenshots", async ({ page }) => {
   await page.goto("/");
   await page.getByText("99.31 %").waitFor();
   await page.screenshot({ path: `${dir ?? ""}/dashboard.png`, fullPage: true });
+  const diagnosis = page.getByRole("region", {
+    name: "AI diagnosis for donblack.dev TLS",
+  });
+  await diagnosis.getByText(/Evidence and tools/).click();
+  await page
+    .locator("section", {
+      has: page.getByRole("heading", { name: "Incidents" }),
+    })
+    .screenshot({ path: `${dir ?? ""}/triage.png` });
   await page.goto("/status");
   await page.getByText("Major outage").waitFor();
   await page.screenshot({ path: `${dir ?? ""}/status.png` });

@@ -1,7 +1,8 @@
 import { CheckCircle2 } from "lucide-react";
 import { dateTime, duration } from "../format";
-import type { IncidentUpdate, IncidentStatus } from "../types";
+import type { IncidentUpdate, IncidentStatus, Triage } from "../types";
 import { StatusBadge } from "./StatusBadge";
+import { TriagePanel } from "./TriagePanel";
 
 export interface IncidentItem {
   id: number;
@@ -10,6 +11,14 @@ export interface IncidentItem {
   startedAt: string;
   resolvedAt: string | null;
   updates: IncidentUpdate[];
+  triage?: Triage;
+}
+
+/** Dashboard-only AI triage controls; the public page passes none. */
+export interface TriageControls {
+  enabled: boolean;
+  starting: ReadonlySet<number>;
+  onInvestigate: (incidentId: number) => void;
 }
 
 const updateLabel: Record<IncidentUpdate["status"], string> = {
@@ -25,9 +34,11 @@ const updateLabel: Record<IncidentUpdate["status"], string> = {
 export function IncidentList({
   incidents,
   empty,
+  triage,
 }: {
   incidents: IncidentItem[];
   empty: string;
+  triage?: TriageControls;
 }) {
   if (incidents.length === 0) {
     return (
@@ -68,6 +79,17 @@ export function IncidentList({
               </li>
             ))}
           </ol>
+          {triage && (
+            <TriagePanel
+              name={inc.name}
+              triage={inc.triage}
+              canInvestigate={triage.enabled}
+              starting={triage.starting.has(inc.id)}
+              onInvestigate={() => {
+                triage.onInvestigate(inc.id);
+              }}
+            />
+          )}
         </li>
       ))}
     </ol>

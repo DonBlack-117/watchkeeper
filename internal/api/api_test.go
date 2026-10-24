@@ -31,6 +31,7 @@ type memStore struct {
 
 	sessionLookups int
 	incidents      []store.Incident
+	triages        map[int64]store.Triage // latest per incident
 }
 
 type memSession struct {
@@ -239,6 +240,27 @@ func (m *memStore) CountOpenIncidents(context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+func (m *memStore) GetIncident(_ context.Context, id int64) (store.Incident, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inc := range m.incidents {
+		if inc.ID == id {
+			return inc, nil
+		}
+	}
+	return store.Incident{}, store.ErrNotFound
+}
+
+func (m *memStore) LatestTriage(_ context.Context, incidentID int64) (store.Triage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.triages[incidentID]
+	if !ok {
+		return t, store.ErrNotFound
+	}
+	return t, nil
 }
 
 func newServer(m *memStore) http.Handler { return newServerWith(m, Options{}) }

@@ -41,7 +41,16 @@ type Config struct {
 	AlertOnDegraded bool   // WK_ALERT_ON_DEGRADED: also alert when a check is only degraded
 	PublicURL       string // WK_PUBLIC_URL: dashboard link added to alerts
 	MetricsAddr     string // WK_METRICS_ADDR: Prometheus /metrics listener; empty disables it
+
+	AnthropicKey     string // WK_ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY): enables AI triage
+	TriageModel      string // WK_TRIAGE_MODEL
+	TriageEffort     string // WK_TRIAGE_EFFORT: low, medium, high, xhigh or max
+	TriageAuto       bool   // WK_TRIAGE_AUTO: investigate each incident when it goes down
+	TriageDailyLimit int    // WK_TRIAGE_DAILY_LIMIT: investigations per 24 hours
 }
+
+// DefaultTriageModel is the Claude model used for incident triage.
+const DefaultTriageModel = "claude-opus-5-5"
 
 // Load reads the environment. It listens on localhost by default and refuses to
 // listen elsewhere without an API token or a dashboard account.
@@ -57,6 +66,9 @@ func Load() (Config, error) {
 		PublicURL:      os.Getenv("WK_PUBLIC_URL"),
 		MetricsAddr:    os.Getenv("WK_METRICS_ADDR"),
 		ReloadInterval: 30 * time.Second,
+		AnthropicKey:   env("WK_ANTHROPIC_API_KEY", os.Getenv("ANTHROPIC_API_KEY")),
+		TriageModel:    env("WK_TRIAGE_MODEL", DefaultTriageModel),
+		TriageEffort:   env("WK_TRIAGE_EFFORT", "high"),
 	}
 	var errs []error
 	var err error
@@ -129,8 +141,28 @@ func Load() (Config, error) {
 			errs = append(errs, errors.New("WK_METRICS_ADDR must differ from WK_ADDR, so /metrics stays off the public port"))
 		}
 	}
+	if c.TriageAuto, err = boolEnv("WK_TRIAGE_AUTO", true); err != nil {
+		errs = append(errs, err)
+	}
+	if c.TriageDailyLimit, err = intEnv("WK_TRIAGE_DAILY_LIMIT", 20, 1, 1000); err != nil {
+		errs = append(errs, err)
+	}
+	switch c.TriageEffort {
+	case "low", "medium", "high", "xhigh", "max":
+	default:
+		errs = append(errs, fmt.Errorf("WK_TRIAGE_EFFORT must be low, medium, high, xhigh or max, got %q", c.TriageEffort))
+	}
+	if !triageModel.MatchString(c.TriageModel) {
+		errs = append(errs, fmt.Errorf("WK_TRIAGE_MODEL %q is not a model id", c.TriageModel))
+	}
+	if c.AnthropicKey != "" && (len(c.AnthropicKey) < 20 || strings.ContainsAny(c.AnthropicKey, " \t\r\n")) {
+		errs = append(errs, errors.New("WK_ANTHROPIC_API_KEY does not look like an API key"))
+	}
 	return c, errors.Join(errs...)
 }
+
+// triageModel accepts model ids such as claude-opus-5-5.
+var triageModel = regexp.MustCompile(`^[a-z0-9][a-z0-9.\-]{2,99}$`)
 
 // chatID accepts a numeric chat id (negative for groups) or a public @channel.
 var chatID = regexp.MustCompile(`^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$`)

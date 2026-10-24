@@ -253,3 +253,23 @@ func TestLongValuesAreCut(t *testing.T) {
 		t.Fatalf("message has %d characters", len([]rune(text)))
 	}
 }
+
+func TestOnDownCalledOncePerEscalation(t *testing.T) {
+	var calls []int64
+	m, f, s := newManager(Options{OnDown: func(_ context.Context, id int64) { calls = append(calls, id) }})
+	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	run(m, f, true, 100, t0)
+	run(m, f, false, 0, t0.Add(time.Minute)) // degraded
+	if len(calls) != 0 {
+		t.Fatalf("degraded must not start an investigation: %v", calls)
+	}
+	run(m, f, false, 0, t0.Add(2*time.Minute))
+	run(m, f, false, 0, t0.Add(3*time.Minute)) // down
+	run(m, f, false, 0, t0.Add(4*time.Minute)) // still down
+	if len(calls) != 1 || calls[0] != f.open[1].ID {
+		t.Fatalf("calls = %v, want the incident once", calls)
+	}
+	if !f.open[1].Notified || len(s.msgs) != 1 {
+		t.Error("the down alert is queued before the investigation starts")
+	}
+}

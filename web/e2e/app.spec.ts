@@ -100,3 +100,47 @@ test("sends a test alert from the incidents card", async ({ page }) => {
     page.getByRole("status").filter({ hasText: "Test alert sent" }),
   ).toBeVisible();
 });
+
+test("shows the AI diagnosis and starts a new investigation", async ({
+  page,
+}) => {
+  await mockApi(page, { signedIn: true });
+  await page.goto("/");
+  const diagnosis = page.getByRole("region", {
+    name: "AI diagnosis for donblack.dev TLS",
+  });
+  await expect(
+    diagnosis.getByText(/stopped answering on port 443/),
+  ).toBeVisible();
+  await expect(diagnosis.getByText("high confidence")).toBeVisible();
+  await expect(
+    diagnosis.getByText("Check that the web server is running on the host"),
+  ).toBeVisible();
+
+  // Evidence and tools are folded until asked for.
+  await expect(diagnosis.getByText("Live probe")).toBeHidden();
+  await diagnosis.getByText(/Evidence and tools \(3 calls\)/).click();
+  await expect(diagnosis.getByText("Live probe")).toBeVisible();
+  await expect(diagnosis.getByText(/19,150\s+tokens/)).toBeVisible();
+
+  await page
+    .getByRole("button", { name: "Investigate with Claude (Bitso API)" })
+    .click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Claude is investigating" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("region", { name: "AI diagnosis for Bitso API" })
+      .getByText(/503 for 20 minutes/),
+  ).toBeVisible();
+});
+
+test("the public status page never shows the AI diagnosis", async ({
+  page,
+}) => {
+  await mockApi(page);
+  await page.goto("/status");
+  await expect(page.getByText("donblack.dev TLS").first()).toBeVisible();
+  await expect(page.getByText(/AI diagnosis|port 443/)).toHaveCount(0);
+});

@@ -44,6 +44,8 @@ type Store interface {
 	ListIncidents(ctx context.Context, q store.IncidentQuery) ([]store.Incident, error)
 	CountOpenIncidents(ctx context.Context) (int, error)
 	ResolveOpen(ctx context.Context, checkID int64, at time.Time) (bool, error)
+	GetIncident(ctx context.Context, id int64) (store.Incident, error)
+	LatestTriage(ctx context.Context, incidentID int64) (store.Triage, error)
 }
 
 // HTTPObserver records served requests; *metrics.Metrics implements it.
@@ -88,6 +90,8 @@ type Options struct {
 	Metrics HTTPObserver
 	// Alerts, when set, powers the test-alert endpoint and the summary.
 	Alerts Alerts
+	// Triage, when set, runs AI investigations of incidents.
+	Triage Triage
 	// AllowPrivate accepts loopback and private targets at validation time.
 	AllowPrivate bool
 	// MaxChecks caps how many checks can exist (default 200).
@@ -110,7 +114,9 @@ type Server struct {
 	limiter      *rateLimiter
 	loginLimiter *rateLimiter
 	testLimiter  *rateLimiter
-	mux          *http.ServeMux
+	// triageLimiter caps manual investigations, which cost API tokens.
+	triageLimiter *rateLimiter
+	mux           *http.ServeMux
 }
 
 // New returns a Server.
@@ -128,14 +134,15 @@ func New(store Store, log *slog.Logger, opts Options) *Server {
 		opts.SessionTTL = sessionTTLDefault
 	}
 	return &Server{
-		store:        store,
-		log:          log,
-		opts:         opts,
-		now:          time.Now,
-		status:       &statusCache{ttl: opts.StatusTTL},
-		limiter:      newRateLimiter(opts.StatusRate, time.Minute),
-		loginLimiter: newRateLimiter(10, time.Minute),
-		testLimiter:  newRateLimiter(5, time.Minute),
+		store:         store,
+		log:           log,
+		opts:          opts,
+		now:           time.Now,
+		status:        &statusCache{ttl: opts.StatusTTL},
+		limiter:       newRateLimiter(opts.StatusRate, time.Minute),
+		loginLimiter:  newRateLimiter(10, time.Minute),
+		testLimiter:   newRateLimiter(5, time.Minute),
+		triageLimiter: newRateLimiter(5, time.Minute),
 	}
 }
 
@@ -158,6 +165,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
 	mux.HandleFunc("GET /api/v1/auth/me", s.me)
 	mux.HandleFunc("GET /api/v1/incidents", s.listIncidents)
+	mux.HandleFunc("GET /api/v1/incidents/{id}", s.getIncident)
+	mux.HandleFunc("GET /api/v1/incidents/{id}/triage", s.getTriage)
+	mux.HandleFunc("POST /api/v1/incidents/{id}/triage", s.startTriage)
 	mux.HandleFunc("POST /api/v1/alerts/test", s.testAlert)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) { notFound(w, "no such endpoint") })
 	if s.opts.Frontend != nil {
@@ -619,7 +629,12 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 	if s.opts.Alerts != nil {
 		channels = s.opts.Alerts.Channels()
 	}
+	triage := map[string]any{"enabled": s.triageEnabled()}
+	if s.triageEnabled() {
+		triage["model"] = s.opts.Triage.Model()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
+		"triage":        triage,
 		"openIncidents": open,
 		"alertChannels": channels,
 		"checks":        len(checks),

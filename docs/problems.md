@@ -36,11 +36,15 @@ Errors are returned as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) proble
 
 ## conflict
 
-`409`. The check limit (`WK_MAX_CHECKS`, 200 by default) has been reached.
+`409`. The check limit (`WK_MAX_CHECKS`, 200 by default) has been reached, an investigation of the incident is already running, or AI triage is not configured (`WK_ANTHROPIC_API_KEY`).
 
 ## rate-limited
 
-`429`. One client made more than 60 requests per minute to `/api/v1/status`, or more than 10 login attempts per minute. Retry after the time in `Retry-After`.
+`429`. One client made more than 60 requests per minute to `/api/v1/status`, more than 10 login attempts per minute, more than 5 manual investigations per minute, or the daily limit of investigations (`WK_TRIAGE_DAILY_LIMIT`) was reached. Retry after the time in `Retry-After`.
+
+## unavailable
+
+`503`. The queue of AI investigations is full. Retry after the time in `Retry-After`.
 
 ## bad-gateway
 

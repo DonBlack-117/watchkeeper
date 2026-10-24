@@ -79,6 +79,43 @@ export const incidents = [
       { at: hoursAgo(2), status: "degraded", error: "timeout" },
       { at: hoursAgo(1.9), status: "down", error: "timeout" },
     ],
+    triage: {
+      id: 4,
+      incidentId: 2,
+      state: "done",
+      trigger: "auto",
+      model: "claude-opus-5-5",
+      summary:
+        "donblack.dev stopped answering on port 443; DNS still resolves.",
+      probableCause:
+        "The server accepts no TCP connections on 443, so the web server or its firewall is down. DNS answers with the same address as before.",
+      confidence: "high",
+      evidence: [
+        "probe_now: timeout after 10000 ms",
+        "dns_lookup A: 76.76.21.21, unchanged",
+      ],
+      nextSteps: [
+        "Check that the web server is running on the host",
+        "Review recent firewall changes",
+      ],
+      toolCalls: [
+        {
+          name: "recent_results",
+          input: '{"limit":10}',
+          outcome: "10 runs, 10 failed",
+        },
+        {
+          name: "dns_lookup",
+          input: '{"record_type":"A"}',
+          outcome: "A: 1 records",
+        },
+        { name: "probe_now", outcome: "failed: timeout in 10000 ms" },
+      ],
+      inputTokens: 18200,
+      outputTokens: 950,
+      startedAt: hoursAgo(1.89),
+      finishedAt: hoursAgo(1.88),
+    } as Record<string, unknown> | undefined,
   },
   {
     id: 1,
@@ -91,6 +128,7 @@ export const incidents = [
       { at: hoursAgo(50), status: "degraded", error: "HTTP 503" },
       { at: hoursAgo(49.6), status: "resolved" },
     ],
+    triage: undefined as Record<string, unknown> | undefined,
   },
 ];
 
@@ -106,11 +144,24 @@ const json = (route: Route, status: number, data?: unknown) =>
 export async function mockApi(page: Page, opts: { signedIn?: boolean } = {}) {
   let signedIn = opts.signedIn ?? false;
   const created: unknown[] = [];
+  // Incidents investigated through the mock, answered as finished right away.
+  const investigated = new Set<number>();
 
   await page.route("**/api/v1/**", async (route) => {
     const req = route.request();
     const url = new URL(req.url());
     const key = `${req.method()} ${url.pathname}`;
+    const triageMatch = /^POST \/api\/v1\/incidents\/(\d+)\/triage$/.exec(key);
+    if (triageMatch) {
+      investigated.add(Number(triageMatch[1]));
+      return json(route, 202, {
+        data: {
+          triageId: 9,
+          incidentId: Number(triageMatch[1]),
+          state: "running",
+        },
+      });
+    }
     switch (key) {
       case "GET /api/v1/auth/me":
         return json(route, 200, {
@@ -158,12 +209,38 @@ export async function mockApi(page: Page, opts: { signedIn?: boolean } = {}) {
         return json(route, 201, { data: c });
       }
       case "GET /api/v1/incidents":
-        return json(route, 200, { data: incidents });
+        return json(route, 200, {
+          data: incidents.map((i) =>
+            investigated.has(i.id)
+              ? {
+                  ...i,
+                  triage: {
+                    id: 9,
+                    incidentId: i.id,
+                    state: "done",
+                    trigger: "manual",
+                    model: "claude-opus-5-5",
+                    summary:
+                      "Bitso answered 503 for 20 minutes during maintenance.",
+                    confidence: "medium",
+                    evidence: [],
+                    nextSteps: [],
+                    toolCalls: [],
+                    inputTokens: 9000,
+                    outputTokens: 400,
+                    startedAt: new Date().toISOString(),
+                    finishedAt: new Date().toISOString(),
+                  },
+                }
+              : i,
+          ),
+        });
       case "POST /api/v1/alerts/test":
         return route.fulfill({ status: 204 });
       case "GET /api/v1/summary":
         return json(route, 200, {
           data: {
+            triage: { enabled: true, model: "claude-opus-5-5" },
             openIncidents: 1,
             alertChannels: ["telegram"],
             checks: 2 + created.length,
@@ -191,10 +268,14 @@ export async function mockApi(page: Page, opts: { signedIn?: boolean } = {}) {
               lastCheckedAt: null,
               daily: c.daily,
             })),
-            incidents: incidents.map(({ checkName, updates, ...i }) => ({
-              ...i,
-              name: checkName,
-              updates: updates.map(({ at, status }) => ({ at, status })),
+            incidents: incidents.map((inc) => ({
+              id: inc.id,
+              checkId: inc.checkId,
+              name: inc.checkName,
+              status: inc.status,
+              startedAt: inc.startedAt,
+              resolvedAt: inc.resolvedAt,
+              updates: inc.updates.map(({ at, status }) => ({ at, status })),
             })),
           },
         });
