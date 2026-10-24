@@ -187,7 +187,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "create session", err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure comes from WK_COOKIE_SECURE, enforced on non-loopback addresses
 		Name:     s.cookieName(),
 		Value:    token,
 		Path:     "/",
@@ -212,7 +212,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // same Secure rule as the login cookie
 		Name: s.cookieName(), Value: "", Path: "/", MaxAge: -1,
 		HttpOnly: true, Secure: s.opts.SecureCookie, SameSite: http.SameSiteStrictMode,
 	})
