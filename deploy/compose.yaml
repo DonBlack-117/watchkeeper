@@ -115,7 +115,7 @@ services:
     networks: [logs]
 
   alloy:
-    image: docker.io/grafana/alloy:v1.21.0
+    image: docker.io/grafana/alloy:v1.21.2
     profiles: [observability]
     restart: unless-stopped
     command:
