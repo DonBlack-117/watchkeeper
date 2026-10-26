@@ -68,7 +68,7 @@ services:
   # ---- observability profile ----
 
   prometheus:
-    image: docker.io/prom/prometheus:v3.15.0
+    image: docker.io/prom/prometheus:v3.15.1
     profiles: [observability]
     restart: unless-stopped
     command:
