@@ -129,7 +129,7 @@ services:
     networks: [internal, logs]
 
   grafana:
-    image: docker.io/grafana/grafana:13.2.4
+    image: docker.io/grafana/grafana:13.3.0
     profiles: [observability]
     restart: unless-stopped
     # Compose checks ${VAR:?} even for services outside the active profile, so
