@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # 1. Frontend. It runs on the build machine's platform: the output is static files.
-FROM --platform=$BUILDPLATFORM docker.io/library/node:22-alpine AS web
+FROM --platform=$BUILDPLATFORM docker.io/library/node:26-alpine AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
