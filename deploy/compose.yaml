@@ -30,7 +30,7 @@ services:
     networks: [internal]
 
   postgres:
-    image: docker.io/library/postgres:16-alpine
+    image: docker.io/library/postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: watchkeeper
