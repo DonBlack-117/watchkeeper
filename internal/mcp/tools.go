@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -53,7 +54,23 @@ func NewClient(baseURL, token string) (*Client, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("WK_URL must be an http or https URL, got %q", baseURL)
 	}
+	// The bearer token would travel in cleartext over plain http. Allow http only
+	// to a loopback host; a remote WK_URL must use https.
+	if token != "" && u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return nil, fmt.Errorf("WK_URL with an API token must use https for a remote host, got %q", baseURL)
+	}
 	return &Client{base: u, token: token, http: &http.Client{Timeout: 30 * time.Second}}, nil
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP literal.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // maxResponse caps an API response passed on to the model.

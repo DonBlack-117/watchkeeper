@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -188,6 +189,16 @@ func (s *Service) IncidentDown(ctx context.Context, incidentID int64) {
 }
 
 func (s *Service) process(parent context.Context, j job) {
+	// A panic in the agent, the tools or the JSON handling of a model reply must
+	// not take down the worker (and with it all monitoring). Record it as a
+	// failed job so the triage row does not stay "running" forever.
+	defer func() {
+		if v := recover(); v != nil {
+			s.log.Error("triage: worker panicked", "triage_id", j.triageID, "incident_id", j.incidentID,
+				"panic", v, "stack", string(debug.Stack()))
+			s.failJob(j, &Failure{Reason: "the investigation crashed"})
+		}
+	}()
 	ctx, cancel := context.WithTimeout(parent, s.opts.Timeout)
 	defer cancel()
 	start := s.now()
@@ -215,7 +226,11 @@ func (s *Service) process(parent context.Context, j job) {
 	sctx, scancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
 	defer scancel()
 	if err := s.store.FinishTriage(sctx, j.triageID, report, s.now()); err != nil {
+		// Leaving the row "running" would block every later investigation of this
+		// incident (the one-running unique index) until a restart, and still count
+		// against the daily limit. Mark it failed instead.
 		s.log.Error("triage: save", "triage_id", j.triageID, "err", err)
+		s.failJob(j, &Failure{Reason: "could not save the diagnosis", InputTokens: report.InputTokens, OutputTokens: report.OutputTokens})
 		return
 	}
 	s.observe("done", report.InputTokens, report.OutputTokens)
@@ -233,7 +248,11 @@ func (s *Service) announce(ctx context.Context, j job, c check.Check, r store.Tr
 		return
 	}
 	inc, err := s.store.GetIncident(ctx, j.incidentID)
-	if err != nil || !inc.Notified {
+	if err != nil {
+		s.log.Error("triage: announce read incident", "triage_id", j.triageID, "incident_id", j.incidentID, "err", err)
+		return
+	}
+	if !inc.Notified {
 		return // nothing was announced, so the diagnosis stays quiet too
 	}
 	var b strings.Builder
@@ -245,7 +264,9 @@ func (s *Service) announce(ctx context.Context, j job, c check.Check, r store.Tr
 	if s.opts.PublicURL != "" {
 		fmt.Fprintf(&b, "\n<a href=\"%s\">Open dashboard</a>", html.EscapeString(s.opts.PublicURL))
 	}
-	s.sender.Enqueue(notify.Message{Text: b.String()})
+	if !s.sender.Enqueue(notify.Message{Text: b.String()}) {
+		s.log.Warn("triage: diagnosis alert dropped (queue full)", "triage_id", j.triageID, "incident_id", j.incidentID)
+	}
 }
 
 func (s *Service) failJob(j job, f *Failure) {

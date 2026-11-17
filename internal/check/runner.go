@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -143,6 +145,14 @@ func (r *Runner) runHTTP(ctx context.Context, c Check, res *Result) {
 	}
 
 	code := resp.StatusCode
+	// Go accepts any three-digit status, but the store only allows 100-599 (all
+	// HTTP defines). A 6xx-9xx reply from a broken or hostile target would fail
+	// SaveResult and silently drop the check, so count it as a failed run with
+	// no status recorded.
+	if code < 100 || code > 599 {
+		res.Error = fmt.Sprintf("invalid HTTP status %d", code)
+		return
+	}
 	res.StatusCode = &code
 	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		exp := resp.TLS.PeerCertificates[0].NotAfter.UTC()
@@ -274,4 +284,18 @@ func truncate(s string, n int) string {
 	}
 	r := []rune(s)
 	return string(r[:n]) + "…"
+}
+
+// sanitizeField cleans a value controlled by a monitored host (a DNS TXT record
+// or a TLS certificate field) before it is shown to the triage model. Control
+// characters, including newlines, are turned into spaces so the value cannot
+// forge structure in the prompt, and the result is truncated to n runes.
+func sanitizeField(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\t' || (unicode.IsControl(r)) {
+			return ' '
+		}
+		return r
+	}, s)
+	return truncate(strings.TrimSpace(s), n)
 }

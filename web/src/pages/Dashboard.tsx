@@ -34,7 +34,13 @@ export function Dashboard({
   const summary = usePoll(api.summary, REFRESH_MS);
   const incidentPoll = usePoll(api.incidents, REFRESH_MS);
   const [testing, setTesting] = useState(false);
-  const [starting, setStarting] = useState<ReadonlySet<number>>(new Set());
+  // Incidents whose investigation was just requested, each mapped to the
+  // startedAt of the triage shown when the button was clicked (or null if there
+  // was none). The lock clears on its own once the server reports a run with a
+  // different startedAt, so no effect or ref sync is needed.
+  const [pending, setPending] = useState<ReadonlyMap<number, string | null>>(
+    new Map(),
+  );
   const [selectedId, setSelectedId] = useState<number>();
   const [editing, setEditing] = useState<Check | "new">();
   const [deleting, setDeleting] = useState<Check>();
@@ -134,22 +140,35 @@ export function Dashboard({
     };
   }, [investigating, reloadIncidents]);
 
+  // An incident is "starting" while its request is pending and the server still
+  // reports the same triage (same startedAt) that was shown at click time. Once
+  // the new run appears with a different startedAt, this is false again, so the
+  // lock clears without any effect or ref. Derived, so it is always consistent.
+  const startedAtOf = (id: number) =>
+    (incidentPoll.data ?? []).find((i) => i.id === id)?.triage?.startedAt ??
+    null;
+  const starting = new Set(
+    [...pending].filter(([id, at]) => startedAtOf(id) === at).map(([id]) => id),
+  );
+
   const investigate = async (incidentId: number) => {
-    setStarting((prev) => new Set(prev).add(incidentId));
+    if (starting.has(incidentId)) return; // ignore a double click
+    const supersede = startedAtOf(incidentId);
+    setPending((prev) => new Map(prev).set(incidentId, supersede));
     try {
       await api.investigate(incidentId);
       setToast("Claude is investigating the incident.");
+      // The lock stays (button hidden, no stale diagnosis) until the refetch
+      // reports a run with a newer startedAt; `starting` above clears it then.
+      reloadIncidents();
     } catch (e) {
       setToast(
         e instanceof Error
           ? `Could not start the investigation: ${e.message}`
           : "Could not start the investigation.",
       );
-    } finally {
-      // The incident list shows "running" from here on.
-      reloadIncidents();
-      setStarting((prev) => {
-        const next = new Set(prev);
+      setPending((prev) => {
+        const next = new Map(prev);
         next.delete(incidentId);
         return next;
       });
@@ -223,10 +242,20 @@ export function Dashboard({
           </button>
         </div>
 
-        {(checks.error ?? summary.error) && (
+        {(checks.error ??
+          summary.error ??
+          incidentPoll.error ??
+          (selected && latency.error)) && (
           <p className="alert" role="alert">
-            Could not load the latest data:{" "}
-            {(checks.error ?? summary.error)?.message}
+            Could not refresh the latest data; showing the last values.{" "}
+            {
+              (
+                checks.error ??
+                summary.error ??
+                incidentPoll.error ??
+                latency.error
+              )?.message
+            }
           </p>
         )}
 

@@ -75,6 +75,24 @@ func TestRunHTTP(t *testing.T) {
 	}
 }
 
+func TestRunHTTPInvalidStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(600) // out of the 100-599 range the store accepts
+	}))
+	defer srv.Close()
+
+	res := NewRunner(true).Run(context.Background(), httpCheck(srv.URL))
+	if res.OK {
+		t.Fatalf("a 600 status should not be OK")
+	}
+	if res.StatusCode != nil {
+		t.Errorf("StatusCode should be nil for an out-of-range status, got %d", *res.StatusCode)
+	}
+	if !strings.Contains(res.Error, "invalid HTTP status 600") {
+		t.Errorf("Error = %q, want it to mention the invalid status", res.Error)
+	}
+}
+
 func TestRunHTTPMeasuresPhases(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer srv.Close()

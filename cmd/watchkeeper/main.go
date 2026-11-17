@@ -128,6 +128,7 @@ func run() error {
 		AllowPrivate:   cfg.AllowPrivate,
 		MaxChecks:      cfg.MaxChecks,
 		Health:         sched.Healthy,
+		OnChange:       func() { sched.Reload() },
 		RequireLogin:   cfg.AdminUser != "",
 		SecureCookie:   cfg.SecureCookie,
 		TrustedProxies: cfg.TrustedProxies,

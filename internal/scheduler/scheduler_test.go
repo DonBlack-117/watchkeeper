@@ -124,6 +124,19 @@ func TestReloadAddsAndRemovesChecks(t *testing.T) {
 	eventually(t, func() bool { return slices.Equal(s.Running(), []int64{2}) }, "check 1 should stop and check 2 start")
 }
 
+func TestReloadNudgeAppliesChangesAtOnce(t *testing.T) {
+	// A long reload interval so only an explicit Reload picks up the change.
+	st := &fakeStore{checks: []check.Check{ck(1)}}
+	s := New(st, &fakeRunner{}, quietLog(), Options{IntervalUnit: time.Millisecond, ReloadInterval: time.Hour})
+	stop := start(t, s)
+	defer stop()
+
+	eventually(t, func() bool { return slices.Equal(s.Running(), []int64{1}) }, "check 1 should start")
+	st.set([]check.Check{ck(2)}, nil)
+	s.Reload()
+	eventually(t, func() bool { return slices.Equal(s.Running(), []int64{2}) }, "Reload should swap to check 2 before the next tick")
+}
+
 func TestReloadErrorKeepsJobs(t *testing.T) {
 	st := &fakeStore{checks: []check.Check{ck(1)}}
 	s := New(st, &fakeRunner{}, quietLog(), Options{IntervalUnit: time.Millisecond, ReloadInterval: 10 * time.Millisecond})

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime/debug"
 	"time"
 )
 
@@ -148,6 +149,13 @@ func (d *Dispatcher) Run(stop context.Context, drain time.Duration) {
 func (d *Dispatcher) Done() <-chan struct{} { return d.done }
 
 func (d *Dispatcher) deliver(ctx context.Context, m Message) {
+	// A panic in a Notifier.Send must not take down the dispatcher goroutine and
+	// with it every later alert; one bad message is dropped and logged instead.
+	defer func() {
+		if v := recover(); v != nil {
+			d.log.Error("alert dispatcher panicked", "panic", v, "stack", string(debug.Stack()))
+		}
+	}()
 	for _, n := range d.notifiers {
 		var err error
 		for attempt := range maxAttempts {

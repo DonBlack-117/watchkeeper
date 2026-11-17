@@ -22,6 +22,8 @@ type memStore struct {
 	triages  map[int64]*store.Triage
 	nextID   int64
 	finished chan int64
+	// failFinish makes FinishTriage return an error, as a save failure would.
+	failFinish bool
 }
 
 func newStore() *memStore {
@@ -73,6 +75,10 @@ func (m *memStore) StartTriage(_ context.Context, incidentID int64, trigger, mod
 
 func (m *memStore) FinishTriage(_ context.Context, id int64, r store.TriageReport, _ time.Time) error {
 	m.mu.Lock()
+	if m.failFinish {
+		m.mu.Unlock()
+		return errors.New("save failed")
+	}
 	t := m.triages[id]
 	t.State, t.Summary, t.Confidence, t.ToolCalls = store.TriageDone, r.Summary, r.Confidence, r.ToolCalls
 	m.mu.Unlock()
@@ -176,6 +182,27 @@ func TestServiceAutoTriage(t *testing.T) {
 	<-svc.Done()
 	if len(obs.results) != 1 || obs.results[0] != "done" {
 		t.Errorf("observed %v", obs.results)
+	}
+}
+
+func TestServiceFinishSaveFailureMarksFailed(t *testing.T) {
+	st := newStore()
+	st.failFinish = true
+	msgs := &fakeMessages{responses: []string{toolUse("end_turn", textBlock(finalJSON))}}
+	svc := newService(st, msgs, nil, nil, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go svc.Run(ctx)
+
+	if _, err := svc.Request(ctx, 9, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	id := wait(t, st)
+	tr, _ := st.LatestTriage(ctx, 9)
+	// A failed save must not leave the row running, or it would block every later
+	// investigation of this incident until a restart.
+	if tr.ID != id || tr.State != store.TriageFailed {
+		t.Errorf("triage = %+v, want state failed", tr)
 	}
 }
 
