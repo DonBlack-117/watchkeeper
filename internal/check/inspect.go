@@ -94,7 +94,7 @@ func (r *Runner) LookupDNS(ctx context.Context, host, recordType string) ([]stri
 	case "TXT":
 		out, err = r.Resolver.LookupTXT(ctx, host)
 		for i, t := range out {
-			out[i] = truncate(t, 200)
+			out[i] = sanitizeField(t, 200)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported record type %q", recordType)
@@ -149,8 +149,8 @@ func (r *Runner) InspectTLS(ctx context.Context, host, addr string) (TLSInfo, er
 	leaf := state.PeerCertificates[0]
 	info := TLSInfo{
 		Version:     tls.VersionName(state.Version),
-		Subject:     truncate(leaf.Subject.String(), 200),
-		Issuer:      truncate(leaf.Issuer.String(), 200),
+		Subject:     sanitizeField(leaf.Subject.String(), 200),
+		Issuer:      sanitizeField(leaf.Issuer.String(), 200),
 		DNSNames:    leaf.DNSNames,
 		NotBefore:   leaf.NotBefore.UTC(),
 		NotAfter:    leaf.NotAfter.UTC(),
@@ -159,6 +159,9 @@ func (r *Runner) InspectTLS(ctx context.Context, host, addr string) (TLSInfo, er
 	}
 	if len(info.DNSNames) > maxDNSAnswers {
 		info.DNSNames = info.DNSNames[:maxDNSAnswers]
+	}
+	for i, n := range info.DNSNames {
+		info.DNSNames[i] = sanitizeField(n, 253)
 	}
 	opts := x509.VerifyOptions{DNSName: host, Roots: r.TLSConfig.RootCAs, Intermediates: x509.NewCertPool(), CurrentTime: r.Now()}
 	for _, c := range state.PeerCertificates[1:] {

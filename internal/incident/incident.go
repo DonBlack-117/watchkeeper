@@ -109,7 +109,11 @@ func (m *Manager) alert(ctx context.Context, c check.Check, res check.Result, tr
 			"duration", inc.ResolvedAt.Sub(inc.StartedAt).Round(time.Second).String())
 		// Only close what was announced, so a short blip never pings anyone.
 		if inc.Notified && m.sender.Enabled() {
-			m.sender.Enqueue(notify.Message{Text: m.resolvedText(c, inc)})
+			if !m.sender.Enqueue(notify.Message{Text: m.resolvedText(c, inc)}) {
+				// The incident is already resolved and nothing retries this, so
+				// at least leave a trace tied to the incident.
+				m.log.Warn("incident: resolved alert dropped (queue full)", "incident_id", inc.ID, "check_id", c.ID, "name", c.Name)
+			}
 		}
 	}
 }

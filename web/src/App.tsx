@@ -16,6 +16,7 @@ export function App() {
 function Admin() {
   const [me, setMe] = useState<Me>();
   const [error, setError] = useState("");
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -36,7 +37,7 @@ function Admin() {
       cancelled = true;
       setUnauthorizedHandler(undefined);
     };
-  }, []);
+  }, [attempt]);
 
   if (error) {
     return (
@@ -44,6 +45,16 @@ function Admin() {
         <p className="alert" role="alert">
           {error}
         </p>
+        <button
+          type="button"
+          className="btn"
+          onClick={() => {
+            setError("");
+            setAttempt((n) => n + 1);
+          }}
+        >
+          Retry
+        </button>
       </main>
     );
   }

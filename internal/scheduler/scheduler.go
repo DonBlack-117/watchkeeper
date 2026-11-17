@@ -45,6 +45,7 @@ type Scheduler struct {
 	log    *slog.Logger
 	opts   Options
 	sem    chan struct{}
+	reload chan struct{} // nudged by Reload to re-read the check list at once
 
 	mu      sync.Mutex
 	running map[int64]*job
@@ -77,7 +78,18 @@ func New(store Store, runner Runner, log *slog.Logger, opts Options) *Scheduler 
 		log:     log,
 		opts:    opts,
 		sem:     make(chan struct{}, opts.MaxConcurrent),
+		reload:  make(chan struct{}, 1),
 		running: make(map[int64]*job),
+	}
+}
+
+// Reload asks the scheduler to re-read the check list now instead of waiting for
+// the next tick, so an edit through the API takes effect at once. It never
+// blocks: a reload already pending absorbs this one.
+func (s *Scheduler) Reload() {
+	select {
+	case s.reload <- struct{}{}:
+	default:
 	}
 }
 
@@ -94,6 +106,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			s.sync(ctx)
+		case <-s.reload:
 			s.sync(ctx)
 		}
 	}
@@ -227,8 +241,12 @@ func (s *Scheduler) runOnce(ctx context.Context, c check.Check) {
 	case <-ctx.Done():
 		return
 	}
-	res := s.runner.Run(ctx, c)
-	<-s.sem
+	// Release with defer so a panic in Run (recovered in loop) frees the slot
+	// instead of leaking one of MaxConcurrent until every check blocks.
+	res := func() check.Result {
+		defer func() { <-s.sem }()
+		return s.runner.Run(ctx, c)
+	}()
 
 	if ctx.Err() != nil {
 		// Shutting down or the check changed mid-run; the cancelled result is not meaningful.

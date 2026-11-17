@@ -182,3 +182,16 @@ func TestNewClientRejectsBadURL(t *testing.T) {
 		}
 	}
 }
+
+func TestNewClientTokenRequiresHTTPSRemote(t *testing.T) {
+	// A token over plain http to a remote host would leak in cleartext.
+	if _, err := NewClient("http://status.example.com", "secret-token"); err == nil {
+		t.Error("http remote URL with a token should be rejected")
+	}
+	// Loopback over http, and any https URL, are fine.
+	for _, u := range []string{"http://127.0.0.1:8090", "http://localhost:8090", "https://status.example.com"} {
+		if _, err := NewClient(u, "secret-token"); err != nil {
+			t.Errorf("%q with a token should be allowed: %v", u, err)
+		}
+	}
+}

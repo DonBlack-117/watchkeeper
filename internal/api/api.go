@@ -98,6 +98,10 @@ type Options struct {
 	MaxChecks int
 	// Health reports scheduler problems for /health; nil means always healthy.
 	Health func() error
+	// OnChange, when set, is called after a check is created, edited or deleted,
+	// so the scheduler re-reads the list at once instead of probing the old
+	// target until the next reload.
+	OnChange func()
 	// StatusTTL is how long the public status is cached (default 15s).
 	StatusTTL time.Duration
 	// StatusRate is how many /status requests one client IP may make per minute (default 60).
@@ -173,7 +177,9 @@ func (s *Server) Handler() http.Handler {
 	if s.opts.Frontend != nil {
 		mux.Handle("/", s.opts.Frontend)
 	}
-	return s.recoverer(s.logRequests(securityHeaders(s.authenticate(mux))))
+	// logRequests wraps recoverer so a panicking handler is still logged and
+	// counted (as the 500 that recoverer writes) instead of bypassing metrics.
+	return s.logRequests(s.recoverer(securityHeaders(s.authenticate(mux))))
 }
 
 // ---- headers ----
@@ -378,8 +384,16 @@ func (s *Server) createCheck(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "create check", err)
 		return
 	}
+	s.changed()
 	w.Header().Set("Location", "/api/v1/checks/"+strconv.FormatInt(created.ID, 10))
 	writeJSON(w, http.StatusCreated, map[string]any{"data": view(created, nil)})
+}
+
+// changed nudges the scheduler to re-read the check list, when wired.
+func (s *Server) changed() {
+	if s.opts.OnChange != nil {
+		s.opts.OnChange()
+	}
 }
 
 func parseID(r *http.Request) (int64, bool) {
@@ -449,6 +463,7 @@ func (s *Server) patchCheck(w http.ResponseWriter, r *http.Request) {
 			s.log.ErrorContext(r.Context(), "resolve incident after edit", "check_id", updated.ID, "err", err)
 		}
 	}
+	s.changed()
 	writeJSON(w, http.StatusOK, map[string]any{"data": view(updated, nil)})
 }
 
@@ -465,6 +480,7 @@ func (s *Server) deleteCheck(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "delete check", err)
 		return
 	}
+	s.changed()
 	w.WriteHeader(http.StatusNoContent)
 }
 

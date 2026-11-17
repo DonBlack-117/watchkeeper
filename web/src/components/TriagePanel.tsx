@@ -73,7 +73,13 @@ export function TriagePanel({
           </p>
         ) : triage ? (
           <>
-            <p className="triage-summary">{triage.summary}</p>
+            {triage.summary ? (
+              <p className="triage-summary">{triage.summary}</p>
+            ) : (
+              <p className="triage-summary subtle">
+                No summary was returned for this investigation.
+              </p>
+            )}
             {triage.probableCause && (
               <p className="triage-cause">
                 <span className="subtle">Probable cause: </span>

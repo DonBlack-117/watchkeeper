@@ -73,20 +73,44 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	s.out = w
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), maxMessage)
-	for sc.Scan() {
-		if ctx.Err() != nil {
+	// Read lines in a goroutine so a signal (ctx cancelled) stops the server even
+	// while it blocks waiting for the next line from an idle client. The reader
+	// goroutine ends when stdin closes, which also happens on exit.
+	lines := make(chan []byte)
+	scanErr := make(chan error, 1)
+	go func() {
+		defer close(lines)
+		for sc.Scan() {
+			b := append([]byte(nil), sc.Bytes()...)
+			select {
+			case lines <- b:
+			case <-ctx.Done():
+				return
+			}
+		}
+		scanErr <- sc.Err()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
 			return ctx.Err()
+		case line, ok := <-lines:
+			if !ok {
+				select {
+				case err := <-scanErr:
+					if err != nil && !errors.Is(err, io.EOF) {
+						return err
+					}
+				default:
+				}
+				return nil
+			}
+			if len(line) == 0 {
+				continue
+			}
+			s.handle(ctx, line)
 		}
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		s.handle(ctx, line)
 	}
-	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	return nil
 }
 
 func (s *Server) handle(ctx context.Context, line []byte) {
